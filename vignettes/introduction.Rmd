@@ -1,0 +1,291 @@
+---
+title: "CoDA log-ratio representations for single cell RNA-seq data using CoDAschd"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+    
+vignette: >
+  %\VignetteIndexEntry{CoDA log-ratio representations for single cell RNA-seq data using CoDAschd}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+2024.09.10
+
+This tutorial introduces how to use CoDAschd package to perform CoDA log-ratio transformations for single cell RNA-seq data matrix. Besides, we demonstrated how to incorporate the CoDA transformed data with current downstream tools and analyses.
+
+load CoDAschd package
+```{r setup}
+library(CoDAschd)
+```
+
+load other packages
+```{r message=FALSE, warning=FALSE}
+library(patchwork)
+library(ggplot2)
+library(easyCODA)
+library(coda.base)
+library(Seurat)
+library(data.table)
+library(MatrixCorrelation)
+library(ggpubr)
+library(scran)
+library(igraph)
+library(slingshot)
+library(RColorBrewer)
+```
+
+# Implementation
+## Read data
+We used a small dataset cellbench-cellmix3 (https://doi.org/10.1038/s41592-019-0425-8 and https://doi.org/10.1186/s13059-020-02132-x) with three cell lines for demonstration.
+```{r echo=TRUE}
+# read data
+raw_dat <- fread("cellbench_cellmix3_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+rownames(raw_dat) <- gsub("_","-",rownames(raw_dat))
+
+metadat <- read.csv("cellmix3.metadata.csv",header=TRUE,stringsAsFactors=FALSE,row.names=1)
+metadat$celltype_f <- factor(metadat$celltype_c,levels=c("H2228","H1975","HCC827"))
+```
+
+## Run various CoDA LR transformations
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# CLR (s/gm(s) based)(default); 
+# other 'countAdd' options included s/max,s/10000,user-defined number(e.g.,1 or 0.1)
+# other 'method' options inlcuded IQLR,LVHA,ILR,mdCLR,manual(user specified genes);groupIQLR,groupLVHA
+clr_sgms <- runCoDAschd_CountAdd(raw_dat,countAdd="s/gm",method="CLR")
+
+# CLR (s/10000 based); 
+clr_s10000 <- runCoDAschd_CountAdd(raw_dat,countAdd="s/10000",method="CLR")
+
+# LogNorm CLR(prior-log-normalized(scale factor=10000) approximation)
+# The scale factor=10000 used in LogNorm CLR was suggested in Seurat LogNorm implementation.
+# set log_normalized=TRUE if input data has already been log-normalized (e.g., Seurat/scanpy log-normalization)
+clr_lognorm <- runCoDAschd_LogNorm(raw_dat,method="CLR",log_normalized=FALSE)
+
+# Seurat LogNorm
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+```
+
+Example output
+```{r echo=TRUE}
+# Raw count
+raw_dat[c("GAPDH","UBC","ACTB"),1:3]
+# CLR(s/gm(s))
+clr_sgms[c("GAPDH","UBC","ACTB"),1:3]
+# CLR(s/10000
+clr_s10000[c("GAPDH","UBC","ACTB"),1:3]
+# CLR(LogNorm with scale factor=10000)
+clr_lognorm[c("GAPDH","UBC","ACTB"),1:3]
+# Raw LogNorm
+raw_lognorm[c("GAPDH","UBC","ACTB"),1:3]
+
+# similarities between clr_s10000 and clr_lognorm
+sum(clr_s10000==clr_lognorm)/(nrow(clr_lognorm)*ncol(clr_lognorm)) #~0.05; clr_s10000 and clr_lognorm are similar but not exactly the same
+```
+
+## Matrix similarites between CLR (s/10000 based) and CLR (LogNorm based with scale factor=10000)
+CLR (s/10000 based) and CLR (LogNorm based with scale factor=10000) are very similar to each other but not totally same. 
+```{r echo=TRUE}
+# RMSE
+# clr_lognorm-clr_s10000
+sqrt(mean((clr_lognorm-clr_s10000)^2))
+# clr_lognorm-clr_sgms
+sqrt(mean((clr_lognorm-clr_sgms)^2))
+# clr_lognorm-raw_lognorm
+sqrt(mean((clr_lognorm-raw_lognorm)^2))
+```
+
+
+# Example downstream analyses
+The CoDA transformed scRNA-seq matrix is easily to be incorporated with other popular downstream analyses. Here we applied two of them as examples.
+
+## Dimension reduction-partial SVD(or Fast Truncated SVD) and Clustering
+We first performed dimension reduction using partial SVD followed by clustering on this dataset with differentiation trajectories, before starting conducting trajectory inference.
+
+Write a function for convenience
+```{r}
+getCluster <- function(x,meta,npc=10,cent=3){
+    
+    tmp <- CreateSeuratObject(counts=x,meta.data=meta,min.cells=0,min.features=0)
+    tmp <- FindVariableFeatures(tmp,nfeatures=3000,verbose=FALSE)
+    tmp <- ScaleData(tmp,verbose=FALSE)
+    tmp <- RunPCA(tmp,verbose=FALSE) # Partial SVD / Fast Truncated SVD
+    
+    # K-means
+    tmp$kmeans <- kmeans(tmp@reductions$pca@cell.embeddings[,1:npc],centers=cent)$cluster
+    # Louvain
+    tmpgraph <- buildSNNGraph(tmp@reductions$pca@cell.embeddings[,1:npc],transposed=T,k=10,d=NA)
+    res <- cluster_louvain(tmpgraph)$membership
+    cc <- aggregate(tmp@reductions$pca@cell.embeddings[,1:npc],list(res),mean)
+    cc <- as.matrix(cc[,-1])
+    hclu <- hclust(dist(cc))
+    clu <- cutree(hclu,cent)
+    clu <- clu[res]      
+    tmp$lv_clu <- clu
+    # Seurat default
+    tmp <- FindNeighbors(tmp,dims=1:npc,verbose=FALSE)
+    tmp <- FindClusters(tmp,verbose=FALSE)
+    
+    tmp <- RunUMAP(tmp,dims=1:npc,verbose=FALSE)
+    return(tmp)
+}
+```
+
+Get partial SVD, UMAP and clustering results
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# create list of transformed data
+dat <- list(raw_lognorm=raw_lognorm,clr_sgms=clr_sgms,clr_s10000=clr_s10000,clr_lognorm=clr_lognorm)
+
+# remove cells without enough information
+dat <- lapply(dat,function(x) x[,rownames(metadat)])
+
+# partial SVD + various clustering methods
+datCluster <- lapply(dat,getCluster,metadat)
+```
+
+### 2-D PCA visualize cell line labels and clusters
+```{r echo=TRUE,results='hide'}
+dat_pca_label <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype_c")+ggtitle(x)
+    dat_pca_label[[x]] <- p
+}
+
+dat_pca_louvain <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="lv_clu")+ggtitle(x)
+    dat_pca_louvain[[x]] <- p
+}
+```
+
+plots (cell line labels(upper) and Louvain clusters(lower))
+```{r echo=TRUE, fig.height=6.4, fig.width=16}
+dat_pca <- c(dat_pca_label,dat_pca_louvain)
+ggarrange(plotlist=dat_pca,ncol=4,nrow=2,labels="AUTO")
+```
+
+### 2-D UMAP visualize cell line labels and clusters
+```{r echo=TRUE,results='hide'}
+dat_umap_label <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype_c")+ggtitle(x)
+    dat_umap_label[[x]] <- p
+}
+
+dat_umap_louvain <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="lv_clu")+ggtitle(x)
+    dat_umap_louvain[[x]] <- p
+}
+```
+
+plots(cell line labels(upper) and Louvain clusters(lower))
+```{r echo=TRUE, fig.height=6.4, fig.width=16}
+dat_umap <- c(dat_umap_label,dat_umap_louvain)
+ggarrange(plotlist=dat_umap,ncol=4,nrow=2,labels="AUTO")
+```
+
+As we use a differentiation trajectory dataset, cell types in 2-D projections are connected to each other, as expected.
+
+
+## Trajectory inference with Slingshot
+We used Slingshot as an example to perform trajectory inference with CoDA transformed scRNA-seq data
+
+### Preprocessing
+```{r echo=TRUE}
+# create list of transformed data
+dat <- list(raw_lognorm=raw_lognorm,clr_sgms=clr_sgms,clr_s10000=clr_s10000,clr_lognorm=clr_lognorm)
+
+# slingshot default processing
+sce <- SingleCellExperiment(assays=List(counts=raw_dat))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+
+# remove cells without enough information
+dat <- lapply(dat,function(x) x[,rownames(metadat)])
+```
+
+write some functions for convenience
+```{r echo=TRUE}
+getSlingshot <- function(x,metad,startclu="0_9_0",endclu=NULL,scaling=TRUE){
+    tmp <- SingleCellExperiment(assays=list(logcounts=as.matrix(x)),colData=metad)
+    tmp_pca <- prcomp(t(assays(tmp)$logcounts),scale.=scaling) #already lognorm;here we scale the data
+    reducedDims(tmp) <- SimpleList(PCA=tmp_pca$x[,1:2])
+    tmp <- slingshot(tmp,clusterLabels='group',reducedDim='PCA',start.clus=startclu,end.clus=endclu)
+    return(tmp)
+}
+
+evalSlingshot <- function(x,method="spearman",...){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    lineages <- c(...)
+    res <- c()
+    for(y in lineages){
+        # match the inferred trajectory with true lineage: determine by max overlaps of cells
+        max_ovlp <- which.max(sapply(pt_col,function(z) 
+            sum(rownames(colData(x)[!is.na(colData(x)[,z]),])%in%rownames(colData(x)[!is.na(colData(x)[,y]),])) ))
+        max_cor <- cor.test(colData(x)[,pt_col[max_ovlp]],colData(x)[,y],method=method)$estimate
+        res <- c(res,max_cor)
+    }
+    names(res) <- lineages
+    return(res)
+}
+
+plotTrajectory <- function(dataset,x,ng=3){
+    tmpcolor <- brewer.pal(ng,'Set1')[dataset[[x]]$celltype_f]
+    plot(reducedDims(dataset[[x]])$PCA,col=tmpcolor,asp=1,pch=16)
+    lines(SlingshotDataSet(dataset[[x]]),lwd=2,type='lineages',col='black')
+    legend("topright",legend=levels(dataset[[x]]$celltype_f),pch=19,col=brewer.pal(ng,'Set1')[factor(levels(dataset[[x]]$celltype_f))])
+    title(main=x)
+}
+```
+
+
+### Run Slingshot (set end point to c("0_0_9","9_0_0"))
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+res1_ss <- lapply(dat,getSlingshot,metadat,endclu=c("9_0_0","0_0_9"),scaling=TRUE)
+```
+
+Spearman correlation between predicted pseudotime and real time label
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+res1_scc_ss <- as.data.frame(lapply(res1_ss,evalSlingshot,"spearman","H2228_to_H1975","H2228_to_HCC827"))
+res1_scc_ss <- as.data.frame(t(res1_scc_ss))
+res1_scc_ss
+```
+
+2-D PCA plots
+```{r echo=TRUE,figures-side, fig.show="hold", out.width="50%"}
+for(x in names(res1_ss)){
+    plotTrajectory(res1_ss,x)
+}
+```
+
+Similarly, the analysis of CoDA transformed scRNA-seq matrix can be easily extended to other downstream applications, e.g., biomarker identification, differential expression analysis, SCENIC regulatory network.
+
+
+# Session information
+```{r}
+sessionInfo()
+```
+
+
+
