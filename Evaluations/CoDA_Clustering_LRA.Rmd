@@ -1,0 +1,5120 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+# not all neccessary in this part
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(robCompositions)
+library(easyCODA)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(scmap)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(SCeQTL)
+library(eQTLsingle)
+library(rawr)
+library(splatter)
+library(combinat)
+library(Hmisc)
+library(plotly)
+library(ISnorm)
+library(dbscan)
+library(coda.base)
+```
+
+clustering functions
+```{r message=FALSE, warning=FALSE}
+getCluster <- function(x,meta,reso=0.01,npc=10,cent=4,scale_data=FALSE){
+    tmp <- CreateSeuratObject(counts=x,meta.data=meta,min.cells=0,min.features=0)
+    tmp <- FindVariableFeatures(tmp,nfeatures=3000,verbose=FALSE)
+    if(scale_data){
+        tmp <- ScaleData(tmp,verbose=FALSE)
+    }else{
+        tmp[["RNA"]]@scale.data <- as.matrix(tmp[["RNA"]]@counts[VariableFeatures(tmp),])
+    }
+    tmp <- RunPCA(tmp,verbose=FALSE)
+    tmp$kmeans <- kmeans(tmp@reductions$pca@cell.embeddings[,1:npc],centers=cent)$cluster
+    tmp <- FindNeighbors(tmp,dims=1:npc,verbose=FALSE)
+    tmp <- FindClusters(tmp,resolution=reso,verbose=FALSE)
+    tmpgraph <- buildSNNGraph(tmp@reductions$pca@cell.embeddings[,1:npc],transposed=T,k=10,d=NA)
+    res <- cluster_louvain(tmpgraph)$membership
+    cc <- aggregate(tmp@reductions$pca@cell.embeddings[,1:npc],list(res),mean)
+    cc <- as.matrix(cc[,-1])
+    hclu <- hclust(dist(cc))
+    clu <- cutree(hclu,cent)
+    clu <- clu[res]      
+    tmp$lv_clu <- clu
+    #tmp <- tmp@meta.data
+    tmp <- RunUMAP(tmp,dims=1:npc,verbose=FALSE)
+    return(tmp)
+}
+
+evalClustering <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"celltype"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$celltype),function(sct){
+        p <- table(x@meta.data[x$celltype==sct,method])/sum(x$celltype==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$celltype,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$celltype)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+
+evalClustering_twoGroup <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"label"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$label),function(sct){
+        p <- table(x@meta.data[x$label==sct,method])/sum(x$label==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$label,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$label)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+
+getGroupIQLRGenes <- function(x,meta,group_col){
+    group <- unique(meta[,group_col])
+    
+    tmp <- CreateSeuratObject(counts=x[,meta[,group_col]==group[1]],meta.data=meta[meta[,group_col]==group[1],],min.cells=0,min.features=0)
+    tmp <- NormalizeData(tmp)
+    tmp <- FindVariableFeatures(tmp,selection.method="vst",nfeatures=nrow(tmp))
+
+    ##IQLR
+    rankedGenes <- data.frame(gene=VariableFeatures(tmp),rank=1:length(VariableFeatures(tmp)))
+    rankedGenes$quartile <- cut2(rankedGenes$rank,g=4)
+    AllselectedGenes <- rankedGenes[rankedGenes$quartile%in%levels(rankedGenes$quartile)[2:3],]$gene
+    
+    for(g in group[-1]){
+        tmp <- CreateSeuratObject(counts=x[,meta[,group_col]==g],meta.data=meta[meta[,group_col]==g,],min.cells=0,min.features=0)
+        tmp <- NormalizeData(tmp)
+        tmp <- FindVariableFeatures(tmp,selection.method="vst",nfeatures=nrow(tmp))
+        
+        rankedGenes <- data.frame(gene=VariableFeatures(tmp),rank=1:length(VariableFeatures(tmp)))
+        rankedGenes$quartile <- cut2(rankedGenes$rank,g=4)
+        selectedGenes <- rankedGenes[rankedGenes$quartile%in%levels(rankedGenes$quartile)[2:3],]$gene
+        AllselectedGenes <- AllselectedGenes[AllselectedGenes%in%selectedGenes]
+    }
+    return(AllselectedGenes)
+}
+
+getGroupLVHAGenes <- function(x,meta,group_col){
+    group <- unique(meta[,group_col])
+    
+    tmp <- CreateSeuratObject(counts=x[,meta[,group_col]==group[1]],meta.data=meta[meta[,group_col]==group[1],],min.cells=0,min.features=0)
+    tmp <- NormalizeData(tmp)
+    tmp <- FindVariableFeatures(tmp,selection.method="vst",nfeatures=nrow(tmp))
+
+    ##LVHA
+    tmpGenes <- tmp@assays$RNA@meta.features
+    tmpGenes$quartile_m <- cut2(tmpGenes$vst.mean,g=4)
+    selectedGenes_m <- rownames(tmpGenes[tmpGenes$quartile_m%in%levels(tmpGenes$quartile_m)[4],])
+    tmpGenes$quartile_v <- cut2(tmpGenes$vst.variance.standardized,g=4)
+    selectedGenes_v <- rownames(tmpGenes[tmpGenes$quartile_v%in%levels(tmpGenes$quartile_v)[1],])
+    AllselectedGenes <- selectedGenes_m[selectedGenes_m%in%selectedGenes_v]
+    
+    for(g in group[-1]){
+        tmp <- CreateSeuratObject(counts=x[,meta[,group_col]==g],meta.data=meta[meta[,group_col]==g,],min.cells=0,min.features=0)
+        tmp <- NormalizeData(tmp)
+        tmp <- FindVariableFeatures(tmp,selection.method="vst",nfeatures=nrow(tmp))
+        
+        tmpGenes <- tmp@assays$RNA@meta.features
+        tmpGenes$quartile_m <- cut2(tmpGenes$vst.mean,g=4)
+        selectedGenes_m <- rownames(tmpGenes[tmpGenes$quartile_m%in%levels(tmpGenes$quartile_m)[4],])
+        tmpGenes$quartile_v <- cut2(tmpGenes$vst.variance.standardized,g=4)
+        selectedGenes_v <- rownames(tmpGenes[tmpGenes$quartile_v%in%levels(tmpGenes$quartile_v)[1],])
+        selectedGenes <- selectedGenes_m[selectedGenes_m%in%selectedGenes_v]
+        AllselectedGenes <- AllselectedGenes[AllselectedGenes%in%selectedGenes]
+    }
+    return(AllselectedGenes)
+}
+```
+
+# effect of different count addition scheme in clustering
+## cellbench
+read data
+```{r message=FALSE, warning=FALSE}
+bulk_dat <- readRDS("GSE86337_processed_count_average_replicates.rds")
+
+##raw
+raw_dat <- fread("cellbench_sc_10x_5cl_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\.")[[1]][2])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(raw_dat),]
+raw_dat <- raw_dat[rownames(bulk_dat),]
+raw_dat <- raw_dat[,metadat$cell]
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p0001_clr <- log2(tmp)
+```
+
+
+### normalize and combine
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGM_CLR=SGMS_clr,P1_CLR=p1_clr,P001_CLR=p001_clr,P00001_CLR=p0001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p0001_clr)
+```
+
+### evaluation
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv 
+```{r}
+res3_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res3_lv))
+```
+
+evaluate kmeans
+```{r}
+res3_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res3_km))
+```
+
+writeout
+```{r}
+#writeout
+all_res <- list(lv=res3_lv,km=res3_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_cellbench_scaling_VarCLR.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+
+for(x in names(datCluster)){
+    # get variance explained
+    tmppca <- datCluster[[x]][["pca"]]
+    total_variance <- tmppca@misc$total.variance
+    # Get the total/top50 variance
+    eigValues <- (tmppca@stdev)^2  ## EigenValues
+    varExplained <- round(eigValues/total_variance*100,2)[1:2] #total
+    #varExplained <- round(eigValues/sum(eigValues)*100,2)[1:2] #top50
+    rm(tmppca)
+    
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)+xlab(paste0("PC1(",varExplained[1],"%)"))+ylab(paste0("PC2(",varExplained[2],"%)"))
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+combine umap/pca plots
+UMAP
+```{r fig.height=7.2, fig.width=9}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGM_CLR","S10000_CLR","P1_CLR","P001_CLR","P00001_CLR")]
+ggarrange(plotlist=p_Scale,ncol=3,nrow=3)
+```
+
+PCA
+```{r fig.height=7.2, fig.width=9}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGM_CLR","S10000_CLR","P1_CLR","P001_CLR","P00001_CLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=3,nrow=3)
+```
+
+## GSE75748
+read data
+```{r message=FALSE, warning=FALSE}
+##bulk
+bulk_dat <- read.csv("/restricted/projectnb/casa/jh50/jinghan/others/SCI/bulk/GSE75748_bulk_cell_type_ec.csv",header=TRUE,row.names=1)
+bulk_dat <- DGEList(bulk_dat)
+keep <- filterByExpr(bulk_dat)
+bulk_dat <- bulk_dat[keep,,keep.lib.sizes=FALSE]
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta <- c("H1","H1","H1","H1","H9","H9","H9","DEC","DEC","EC","EC","EC","HFF","HFF","HFF","NPC","NPC","TB","TB")
+mm <- model.matrix(~0 + bulk_meta)
+bulk_dat <- voom(bulk_dat,mm,plot=FALSE)$E
+bulk_dat <- data.frame(H1=apply(bulk_dat[,1:4],1,mean),H9=apply(bulk_dat[,5:7],1,mean),DEC=apply(bulk_dat[,8:9],1,mean),EC=apply(bulk_dat[,10:12],1,mean),HFF=apply(bulk_dat[,13:15],1,mean),NPC=apply(bulk_dat[,16:17],1,mean),TB=apply(bulk_dat[,18:19],1,mean))
+
+##raw
+raw_dat <- fread("/restricted/projectnb/casa/jh50/jinghan/others/SCI/rawcount_txt/GSE75748_sc_cell_type_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(raw_dat),]
+raw_dat <- raw_dat[rownames(bulk_dat),]
+raw_dat <- raw_dat[,metadat$cell]
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p0001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGeoMeanS_CLR=SGMS_clr,p1_CLR=p1_clr,p001_CLR=p001_clr,p0001_CLR=p0001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p0001_clr)
+
+#remove inconsistant genes
+#bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat$Raw_LogNorm),]
+#dat <- lapply(dat,function(x) x[rownames(bulk_dat),] )
+#dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### CoDA scaling evaluation
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=7,scale_data=TRUE)
+```
+
+evaluate lv 
+```{r}
+res3_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res3_lv))
+```
+
+evaluate kmeans
+```{r}
+res3_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res3_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res3_lv,km=res3_km)
+saveRDS(all_res,"/restricted/projectnb/casa/jh50/jinghan/others/SCI/EvalCoDA/results/Clustering/SC_Clustering_EvalRes_GSE75748_scaling_VarCLR_FiltBulkGeneFirst.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+### combine umap/pca plots
+combine plots UMAP scale(good for 0.01,0.0001)
+```{r fig.height=7.2, fig.width=9}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGeoMeanS_CLR","S10000_CLR","p1_CLR","p001_CLR","p0001_CLR")]
+ggarrange(plotlist=p_Scale,ncol=3,nrow=3)
+```
+
+combine plots PCA scale
+```{r fig.height=7.2, fig.width=9}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGeoMeanS_CLR","S10000_CLR","p1_CLR","p001_CLR","p0001_CLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=3,nrow=3)
+```
+
+## GSE81861
+```{r}
+##bulk
+bulk_dat <- readRDS("bulk_of_GSE81861_with_replicates_TPM.rds")
+bulk_dat <- bulk_dat[rowSums(bulk_dat>0)>0,]
+filterGene <- which(apply(bulk_dat,1,max)<5)
+bulk_dat <- bulk_dat[-filterGene,]
+bulk_meta <- c("K562","K562","A549","A549","GM12878","GM12878","K562","K562","IMR90","IMR90","H1","H1","GM12878","GM12878") 
+bulk_dat <- log2(bulk_dat+1)
+
+##raw
+raw_dat <- fread("GSE81861_ENCODE_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(raw_dat),]
+raw_dat <- raw_dat[rownames(bulk_dat),]
+raw_dat <- raw_dat[,metadat$cell]
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p0001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGeoMeanS_CLR=SGMS_clr,p1_CLR=p1_clr,p001_CLR=p001_clr,p0001_CLR=p0001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p0001_clr)
+```
+
+### CoDA evaluation
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv 
+```{r}
+res3_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res3_lv))
+```
+
+evaluate kmeans
+```{r}
+res3_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res3_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res3_lv,km=res3_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_GSE81861_VarCLR.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+combine umap/pca plots
+```{r fig.height=7.2, fig.width=9}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGeoMeanS_CLR","S10000_CLR","p1_CLR","p001_CLR","p0001_CLR")]
+ggarrange(plotlist=p_Scale,ncol=3,nrow=3)
+```
+
+```{r fig.height=7.2, fig.width=9}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGeoMeanS_CLR","S10000_CLR","p1_CLR","p001_CLR","p0001_CLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=3,nrow=3)
+```
+
+## sorted PBMC
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("sortedPBMC_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+metadat <- read.table("sortedPBMC_labels.txt",sep="\t",header=FALSE,stringsAsFactors=FALSE)
+metadat$cell <- colnames(raw_dat)
+metadat$celltype <- metadat$V1
+rownames(metadat) <- metadat$cell
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+
+### normalize and combine
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGM_CLR=SGMS_clr,P1_CLR=p1_clr,P001_CLR=p001_clr,P00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove inconsistant genes
+dat <- lapply(dat,function(x) x[rownames(dat$Raw_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### CoDA evaluation
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=10,scale_data=TRUE,npc=10)
+```
+
+evaluate lv
+```{r}
+res3_lv <- as.data.frame(lapply(datCluster,evalClustering,npc=10))
+as.data.frame(t(res3_lv))
+```
+
+evaluate kmeans
+```{r}
+res3_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans",npc=10))
+as.data.frame(t(res3_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res3_lv,km=res3_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_sortedPBMC_VarCLR.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+
+for(x in names(datCluster)){
+    # get variance explained
+    tmppca <- datCluster[[x]][["pca"]]
+    total_variance <- tmppca@misc$total.variance
+    # Get the total/top50 variance
+    eigValues <- (tmppca@stdev)^2  ## EigenValues
+    varExplained <- round(eigValues/total_variance*100,2)[1:2] #total
+    #varExplained <- round(eigValues/sum(eigValues)*100,2)[1:2] #top50
+    rm(tmppca)
+    
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)+xlab(paste0("PC1(",varExplained[1],"%)"))+ylab(paste0("PC2(",varExplained[2],"%)"))
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+combine umap/pca plots
+```{r fig.height=7.2, fig.width=10}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGM_CLR","S10000_CLR","P1_CLR","P001_CLR","P00001_CLR")]
+ggarrange(plotlist=p_Scale,ncol=3,nrow=3)
+```
+
+```{r fig.height=7.2, fig.width=10}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","LogNorm_CLR","SMAX_CLR","SGM_CLR","S10000_CLR","P1_CLR","P001_CLR","P00001_CLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=3,nrow=3)
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout43
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGeoMeanS_CLR=SGMS_clr,p1_CLR=p1_clr,p001_CLR=p001_clr,p00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$Raw_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evaluation
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout43_VarCLR.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout43 (ground truth)
+cell level
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(truedat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(truedat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(truedat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(truedat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(truedat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(truedat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(True_LogNorm=raw_lognorm,True_SCT=raw_sct,LogNorm_CLR=lognorm_clr,True_S10000_CLR=S10000_clr,True_SMAX_CLR=SMAX_clr,True_SGM_CLR=SGMS_clr,True_P1_CLR=p1_clr,True_P001_CLR=p001_clr,True_P00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$True_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evluation
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_SimTrue_CB10x5cl_dropout43_scaling_VarCLR.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout68
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGeoMeanS_CLR=SGMS_clr,p1_CLR=p1_clr,p001_CLR=p001_clr,p00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$Raw_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evaluation
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_oridropout68_VarCLR.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout68(ground truth)
+cell level
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(truedat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(truedat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(truedat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(truedat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(truedat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(truedat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(True_LogNorm=raw_lognorm,True_SCT=raw_sct,LogNorm_CLR=lognorm_clr,True_S10000_CLR=S10000_clr,True_SMAX_CLR=SMAX_clr,True_SGM_CLR=SGMS_clr,True_P1_CLR=p1_clr,True_P001_CLR=p001_clr,True_P00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$True_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evaluations
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_SimTrue_CB10x5cl_oridropout68_VarCLR.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout92
+cell level
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGeoMeanS_CLR=SGMS_clr,p1_CLR=p1_clr,p001_CLR=p001_clr,p00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$Raw_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evaluations
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout92_VarCLR.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout92(ground truth)
+cell level
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(truedat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(truedat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(truedat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(truedat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(truedat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(truedat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(True_LogNorm=raw_lognorm,True_SCT=raw_sct,LogNorm_CLR=lognorm_clr,True_S10000_CLR=S10000_clr,True_SMAX_CLR=SMAX_clr,True_SGM_CLR=SGMS_clr,True_P1_CLR=p1_clr,True_P001_CLR=p001_clr,True_P00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$True_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evaluations
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_SimTrue_CB10x5cl_dropout92_VarCLR.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- rownames(metadat)
+metadat$celltype <- metadat$Group
+
+metadat$G_C <- NA
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition1",]$G_C <- "G1C1"
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition2",]$G_C <- "G1C2"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition1",]$G_C <- "G2C1"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition2",]$G_C <- "G2C2"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition1",]$G_C <- "G3C1"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition2",]$G_C <- "G3C2"
+
+colnames(raw_dat) <- metadat$cell
+colnames(truedat) <- metadat$cell
+colnames(MAGIC_dat) <- metadat$cell
+colnames(alra_dat) <- metadat$cell
+
+rownames(raw_dat) <- sub("_","-",rownames(raw_dat))
+rownames(truedat) <- sub("_","-",rownames(truedat))
+rownames(MAGIC_dat) <- sub("_","-",rownames(MAGIC_dat))
+rownames(alra_dat) <- sub("_","-",rownames(alra_dat))
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(raw_dat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(raw_dat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(raw_dat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(raw_dat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(raw_dat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(raw_dat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,LogNorm_CLR=lognorm_clr,S10000_CLR=S10000_clr,SMAX_CLR=SMAX_clr,SGeoMeanS_CLR=SGMS_clr,p1_CLR=p1_clr,p001_CLR=p001_clr,p00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$Raw_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evaluations
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=6,scale_data=TRUE)
+```
+
+```{r}
+evalClustering_tmp <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"G_C"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$G_C),function(sct){
+        p <- table(x@meta.data[x$G_C==sct,method])/sum(x$G_C==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$G_C,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$G_C)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+```
+
+evaluate lv
+```{r}
+res9_lv_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp))
+as.data.frame(t(res9_lv_6g))
+```
+
+evaluate km
+```{r}
+res9_km_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp,method="kmeans"))
+as.data.frame(t(res9_km_6g))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv6g=res9_lv_6g,km6g=res9_km_6g)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_splatPop_dropout90_VarCLR.rds")
+```
+
+UMAP cell type
+```{r fig.height=7.5, fig.width=12}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="G_C")+ggtitle(x)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+
+ggarrange(plotlist=p_Scale,ncol=4,nrow=3)
+```
+
+PCA cell type
+```{r fig.height=7.5, fig.width=12}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="G_C")+ggtitle(x)
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+ggarrange(plotlist=p_Scale_pca,ncol=4,nrow=3)
+```
+
+
+## Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90(ground truth)
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- rownames(metadat)
+metadat$celltype <- metadat$Group
+
+metadat$G_C <- NA
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition1",]$G_C <- "G1C1"
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition2",]$G_C <- "G1C2"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition1",]$G_C <- "G2C1"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition2",]$G_C <- "G2C2"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition1",]$G_C <- "G3C1"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition2",]$G_C <- "G3C2"
+
+colnames(raw_dat) <- metadat$cell
+colnames(truedat) <- metadat$cell
+colnames(MAGIC_dat) <- metadat$cell
+colnames(alra_dat) <- metadat$cell
+
+rownames(raw_dat) <- sub("_","-",rownames(raw_dat))
+rownames(truedat) <- sub("_","-",rownames(truedat))
+rownames(MAGIC_dat) <- sub("_","-",rownames(MAGIC_dat))
+rownames(alra_dat) <- sub("_","-",rownames(alra_dat))
+```
+
+### compositional data
+```{r}
+#CoDA log-norm based
+raw_coda_clr <- t(CLOSE(t(truedat))*10000)
+raw_coda_clr <- log2(raw_coda_clr+1)
+lognorm_clr <- apply(raw_coda_clr,2,function(x) x-mean(x))
+
+#CoDA add to raw s/10000
+tmp <- as.matrix(truedat)
+tmp <- apply(tmp,2,function(x) x+(sum(x)/10000) )
+tmp <- t(CLOSE(t(tmp)))
+S10000_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+S10000_clr <- log2(S10000_clr)
+
+#CoDA add to raw s/max(s)
+tmp <- as.matrix(truedat)
+max_s <- max(apply(tmp,2,sum))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/max_s) )
+tmp <- t(CLOSE(t(tmp)))
+SMAX_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SMAX_clr <- log2(SMAX_clr)
+
+#CoDA add to raw s/gm(s)
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+SGMS_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+SGMS_clr <- log2(SGMS_clr)
+
+#CoDA add to raw 1
+tmp <- as.matrix(truedat)+1
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p1_clr <- log2(tmp)
+
+#CoDA add to raw 0.01
+tmp <- as.matrix(truedat)+0.01
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p001_clr <- log2(tmp)
+
+#CoDA add to raw 0.0001
+tmp <- as.matrix(truedat)+0.0001
+tmp <- t(CLOSE(t(tmp)))
+tmp <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+p00001_clr <- log2(tmp)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(True_LogNorm=raw_lognorm,True_SCT=raw_sct,LogNorm_CLR=lognorm_clr,True_S10000_CLR=S10000_clr,True_SMAX_CLR=SMAX_clr,True_SGM_CLR=SGMS_clr,True_P1_CLR=p1_clr,True_P001_CLR=p001_clr,True_P00001_CLR=p00001_clr)
+rm(raw_dat)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(lognorm_clr)
+rm(S10000_clr)
+rm(SMAX_clr)
+rm(SGMS_clr)
+rm(p1_clr)
+rm(p001_clr)
+rm(p00001_clr)
+
+#remove low expressed/inconsistent genes
+dat <- lapply(dat,function(x) x[rownames(dat$True_LogNorm),] )
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### evaluations
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=6,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res9_lv_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp))
+as.data.frame(t(res9_lv_6g))
+```
+
+evaluate km
+```{r}
+res9_km_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp,method="kmeans"))
+as.data.frame(t(res9_km_6g))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv6g=res9_lv_6g,km6g=res9_km_6g)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_SimTrue_splatPop_dropout90_VarCLR.rds")
+```
+
+UMAP cell type
+```{r fig.height=7.5, fig.width=12}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="G_C")+ggtitle(x)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+
+ggarrange(plotlist=p_Scale,ncol=4,nrow=3)
+```
+
+PCA cell type
+```{r fig.height=7.5, fig.width=12}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="G_C")+ggtitle(x)
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+ggarrange(plotlist=p_Scale_pca,ncol=4,nrow=3)
+```
+
+## summary and visualization(real)
+read data
+```{r}
+d1 <- readRDS("results/Clustering/SC_Clustering_EvalRes_cellbench_VarCLR.rds")
+d2 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE75748_VarCLR.rds")
+d3 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE81861_VarCLR.rds")
+d4 <- readRDS("results/Clustering/SC_Clustering_EvalRes_sortedPBMC_VarCLR.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res3_lv <- d3$lv
+res4_lv <- d4$lv
+
+res1_km <- d1$km
+res2_km <- d2$km
+res3_km <- d3$km
+res4_km <- d4$km
+
+colnames(res1_lv)[which(colnames(res1_lv)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res2_lv)[which(colnames(res2_lv)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res3_lv)[which(colnames(res3_lv)=="p0001_CLR")] <- "p00001_CLR"
+res2_lv <- res2_lv[,colnames(res1_lv)]
+res3_lv <- res3_lv[,colnames(res1_lv)]
+res4_lv <- res4_lv[,colnames(res1_lv)]
+
+colnames(res1_km)[which(colnames(res1_km)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res2_km)[which(colnames(res2_km)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res3_km)[which(colnames(res3_km)=="p0001_CLR")] <- "p00001_CLR"
+res2_km <- res2_km[,colnames(res1_km)]
+res3_km <- res3_km[,colnames(res1_km)]
+res4_km <- res4_km[,colnames(res1_km)]
+```
+
+process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp4 <- res4_lv[i,1]-res4_lv[i,-1]
+    
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp4 <- res4_lv[i,-1]-res4_lv[i,1]
+    #tmp5 <- res5_lv[i,-1]-res5_lv[i,1]
+    #tmp6 <- res6_lv[i,-1]-res6_lv[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res1_lv)[-1]
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+rename
+```{r}
+res_lv_melt$method <- as.character(res_lv_melt$method)
+res_lv_melt[res_lv_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_melt[res_lv_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_melt[res_lv_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_melt[res_lv_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+res_lv_median$method <- as.character(res_lv_median$method)
+res_lv_median[res_lv_median$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_median[res_lv_median$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_median[res_lv_median$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_median[res_lv_median$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+rownames(res_lv_median)[rownames(res_lv_median)=="SGeoMeanS_CLR"] <- "SGM_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p1_CLR"] <- "P1_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p001_CLR"] <- "P001_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p00001_CLR"] <- "P00001_CLR"
+
+res_lv_median_melt$method <- as.character(res_lv_median_melt$method)
+res_lv_median_melt[res_lv_median_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_melt$method <- factor(res_lv_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.25),-0.25,tmp_hm$Metrics_Difference)
+#tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference>0.1,0.1,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(4.5,8.5,12.5),linetype="dashed")
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[,]
+#tmp_hm <- tmp_hm[!tmp_hm$method%in%c("True_LogNorm","True_CLR"),]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.05),]$Metrics_Difference <- -0.05
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+real_s_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)(real data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+real_s_lv_hm
+```
+
+process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp4 <- res4_km[i,1]-res4_km[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp4 <- res4_km[i,-1]-res4_km[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res1_km)[-1]
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+rename
+```{r}
+res_km_melt$method <- as.character(res_km_melt$method)
+res_km_melt[res_km_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_melt[res_km_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_melt[res_km_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_melt[res_km_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+res_km_median$method <- as.character(res_km_median$method)
+res_km_median[res_km_median$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_median[res_km_median$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_median[res_km_median$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_median[res_km_median$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+rownames(res_km_median)[rownames(res_km_median)=="SGeoMeanS_CLR"] <- "SGM_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p1_CLR"] <- "P1_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p001_CLR"] <- "P001_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p00001_CLR"] <- "P00001_CLR"
+
+res_km_median_melt$method <- as.character(res_km_median_melt$method)
+res_km_median_melt[res_km_median_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_median_melt[res_km_median_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_median_melt[res_km_median_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_median_melt[res_km_median_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_melt$method <- factor(res_km_melt$method,levels=rank1)
+
+tmp_hm <- res_km_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.25),-0.25,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(4.5,8.5,12.5),linetype="dashed")
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+
+tmp_hm <- res_km_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.05),]$Metrics_Difference <- -0.05
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+real_s_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)(real data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+real_s_km_hm
+```
+
+## summary and visualization(sim)
+read data
+```{r}
+d1 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout43_VarCLR.rds")
+d2 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_oridropout68_VarCLR.rds")
+d3 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout92_VarCLR.rds")
+d4 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_splatPop_dropout90_VarCLR.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res3_lv <- d3$lv
+res4_lv <- d4$lv6g
+
+res1_km <- d1$km
+res2_km <- d2$km
+res3_km <- d3$km
+res4_km <- d4$km6g
+
+res2_lv <- res2_lv[,colnames(res1_lv)]
+res3_lv <- res3_lv[,colnames(res1_lv)]
+res4_lv <- res4_lv[,colnames(res1_lv)]
+
+res2_km <- res2_km[,colnames(res1_km)]
+res3_km <- res3_km[,colnames(res1_km)]
+res4_km <- res4_km[,colnames(res1_km)]
+```
+
+process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp4 <- res4_lv[i,1]-res4_lv[i,-1]
+    
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp4 <- res4_lv[i,-1]-res4_lv[i,1]
+    
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res1_lv)[-1]
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+rename
+```{r}
+res_lv_melt$method <- as.character(res_lv_melt$method)
+res_lv_melt[res_lv_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_melt[res_lv_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_melt[res_lv_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_melt[res_lv_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+res_lv_median$method <- as.character(res_lv_median$method)
+res_lv_median[res_lv_median$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_median[res_lv_median$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_median[res_lv_median$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_median[res_lv_median$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+rownames(res_lv_median)[rownames(res_lv_median)=="SGeoMeanS_CLR"] <- "SGM_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p1_CLR"] <- "P1_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p001_CLR"] <- "P001_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p00001_CLR"] <- "P00001_CLR"
+
+res_lv_median_melt$method <- as.character(res_lv_median_melt$method)
+res_lv_median_melt[res_lv_median_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_melt$method <- factor(res_lv_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.25),-0.25,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(4.5,8.5,12.5),linetype="dashed")
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[,]
+#tmp_hm <- tmp_hm[!tmp_hm$method%in%c("True_LogNorm","True_CLR"),]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.1),]$Metrics_Difference <- -0.1
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+sim_s_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)(simulated data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+sim_s_lv_hm
+```
+
+process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp4 <- res4_km[i,1]-res4_km[i,-1]
+
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp4 <- res4_km[i,-1]-res4_km[i,1]
+
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res1_km)[-1]
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+rename
+```{r}
+res_km_melt$method <- as.character(res_km_melt$method)
+res_km_melt[res_km_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_melt[res_km_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_melt[res_km_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_melt[res_km_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+res_km_median$method <- as.character(res_km_median$method)
+res_km_median[res_km_median$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_median[res_km_median$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_median[res_km_median$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_median[res_km_median$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+rownames(res_km_median)[rownames(res_km_median)=="SGeoMeanS_CLR"] <- "SGM_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p1_CLR"] <- "P1_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p001_CLR"] <- "P001_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p00001_CLR"] <- "P00001_CLR"
+
+res_km_median_melt$method <- as.character(res_km_median_melt$method)
+res_km_median_melt[res_km_median_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_median_melt[res_km_median_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_median_melt[res_km_median_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_median_melt[res_km_median_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_melt$method <- factor(res_km_melt$method,levels=rank1)
+
+tmp_hm <- res_km_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.25),-0.25,tmp_hm$Metrics_Difference)
+#tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference>0.1,0.1,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(4.5,8.5,12.5),linetype="dashed")
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+
+tmp_hm <- res_km_median_melt[,]
+#tmp_hm <- tmp_hm[!tmp_hm$method%in%c("True_LogNorm","True_CLR"),]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.1),]$Metrics_Difference <- -0.1
+#tmp_hm[tmp_hm$Metrics_Difference>(0.25),]$Metrics_Difference <- 0.25
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+sim_s_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)(simulated data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+sim_s_km_hm
+```
+
+## summary and visualization(sim-true)
+### scaling 
+read data
+```{r}
+d1 <- readRDS("results/Clustering/SC_Clustering_EvalRes_SimTrue_CB10x5cl_dropout43_VarCLR.rds")
+d2 <- readRDS("results/Clustering/SC_Clustering_EvalRes_SimTrue_CB10x5cl_oridropout68_VarCLR.rds")
+d3 <- readRDS("results/Clustering/SC_Clustering_EvalRes_SimTrue_CB10x5cl_dropout92_VarCLR.rds")
+d4 <- readRDS("results/Clustering/SC_Clustering_EvalRes_SimTrue_splatPop_dropout90_VarCLR.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res3_lv <- d3$lv
+res4_lv <- d4$lv6g
+
+res1_km <- d1$km
+res2_km <- d2$km
+res3_km <- d3$km
+res4_km <- d4$km6g
+
+res2_lv <- res2_lv[,colnames(res1_lv)]
+res3_lv <- res3_lv[,colnames(res1_lv)]
+res4_lv <- res4_lv[,colnames(res1_lv)]
+
+res2_km <- res2_km[,colnames(res1_km)]
+res3_km <- res3_km[,colnames(res1_km)]
+res4_km <- res4_km[,colnames(res1_km)]
+```
+
+process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp4 <- res4_lv[i,1]-res4_lv[i,-1]
+    
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp4 <- res4_lv[i,-1]-res4_lv[i,1]
+    
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res1_lv)[-1]
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_melt$method <- factor(res_lv_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.25),-0.25,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(4.5,8.5,12.5),linetype="dashed")
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.1),]$Metrics_Difference <- -0.1
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+simtrue_s_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)(simulated ground truth)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+simtrue_s_lv_hm
+```
+
+process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp4 <- res4_km[i,1]-res4_km[i,-1]
+    
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp4 <- res4_km[i,-1]-res4_km[i,1]
+    
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res1_km)[-1]
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_melt$method <- factor(res_km_melt$method,levels=rank1)
+
+tmp_hm <- res_km_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.25),-0.25,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(4.5,8.5,12.5),linetype="dashed")
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+
+tmp_hm <- res_km_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.3),]$Metrics_Difference <- -0.3
+tmp_hm[tmp_hm$Metrics_Difference>(0.3),]$Metrics_Difference <- 0.3
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+simtrue_s_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)(simulated ground truth)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+simtrue_s_km_hm
+```
+
+## CoDA summary for individual real and simulated datasets
+read data
+```{r}
+d1 <- readRDS("results/Clustering/SC_Clustering_EvalRes_cellbench_VarCLR.rds")
+d2 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE75748_VarCLR.rds")
+d3 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE81861_VarCLR.rds")
+d4 <- readRDS("results/Clustering/SC_Clustering_EvalRes_sortedPBMC_VarCLR.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res3_lv <- d3$lv
+res4_lv <- d4$lv
+
+res1_km <- d1$km
+res2_km <- d2$km
+res3_km <- d3$km
+res4_km <- d4$km
+
+colnames(res1_lv)[which(colnames(res1_lv)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res2_lv)[which(colnames(res2_lv)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res3_lv)[which(colnames(res3_lv)=="p0001_CLR")] <- "p00001_CLR"
+res2_lv <- res2_lv[,colnames(res1_lv)]
+res3_lv <- res3_lv[,colnames(res1_lv)]
+res4_lv <- res4_lv[,colnames(res1_lv)]
+
+colnames(res1_km)[which(colnames(res1_km)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res2_km)[which(colnames(res2_km)=="p0001_CLR")] <- "p00001_CLR"
+colnames(res3_km)[which(colnames(res3_km)=="p0001_CLR")] <- "p00001_CLR"
+res2_km <- res2_km[,colnames(res1_km)]
+res3_km <- res3_km[,colnames(res1_km)]
+res4_km <- res4_km[,colnames(res1_km)]
+
+###Sim
+d5 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout43_VarCLR.rds")
+d6 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_oridropout68_VarCLR.rds")
+d7 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout92_VarCLR.rds")
+d8 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_splatPop_dropout90_VarCLR.rds")
+
+res5_lv <- d5$lv
+res6_lv <- d6$lv
+res7_lv <- d7$lv
+res8_lv <- d8$lv6g
+
+res5_km <- d5$km
+res6_km <- d6$km
+res7_km <- d7$km
+res8_km <- d8$km6g
+
+res5_lv <- res5_lv[,colnames(res1_lv)]
+res6_lv <- res6_lv[,colnames(res1_lv)]
+res7_lv <- res7_lv[,colnames(res1_lv)]
+res8_lv <- res8_lv[,colnames(res1_lv)]
+
+res5_km <- res5_km[,colnames(res1_km)]
+res6_km <- res6_km[,colnames(res1_km)]
+res7_km <- res7_km[,colnames(res1_km)]
+res8_km <- res8_km[,colnames(res1_km)]
+```
+
+### process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp4 <- res4_lv[i,1]-res4_lv[i,-1]
+    tmp5 <- res5_lv[i,1]-res5_lv[i,-1]
+    tmp6 <- res6_lv[i,1]-res6_lv[i,-1]
+    tmp7 <- res7_lv[i,1]-res7_lv[i,-1]
+    tmp8 <- res8_lv[i,1]-res8_lv[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_SplatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp4 <- res4_lv[i,-1]-res4_lv[i,1]
+    tmp5 <- res5_lv[i,-1]-res5_lv[i,1]
+    tmp6 <- res6_lv[i,-1]-res6_lv[i,1]
+    tmp7 <- res7_lv[i,-1]-res7_lv[i,1]
+    tmp8 <- res8_lv[i,-1]-res8_lv[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_SplatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res_lv)
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+rename
+```{r}
+res_lv_melt$method <- as.character(res_lv_melt$method)
+res_lv_melt[res_lv_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_melt[res_lv_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_melt[res_lv_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_melt[res_lv_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+res_lv_median$method <- as.character(res_lv_median$method)
+res_lv_median[res_lv_median$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_median[res_lv_median$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_median[res_lv_median$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_median[res_lv_median$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+rownames(res_lv_median)[rownames(res_lv_median)=="SGeoMeanS_CLR"] <- "SGM_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p1_CLR"] <- "P1_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p001_CLR"] <- "P001_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="p00001_CLR"] <- "P00001_CLR"
+
+res_lv_median_melt$method <- as.character(res_lv_median_melt$method)
+res_lv_median_melt[res_lv_median_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+```
+
+heatmap(all datasets&metrics)
+```{r fig.height=3}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_melt$method <- factor(res_lv_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.15),-0.15,tmp_hm$Metrics_Difference)
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference>0.15,0.15,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+all_s_lv_hm_ind <- ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(8.5,16.5,24.5),linetype="dashed")+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+all_s_lv_hm_ind
+```
+
+### process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp4 <- res4_km[i,1]-res4_km[i,-1]
+    tmp5 <- res5_km[i,1]-res5_km[i,-1]
+    tmp6 <- res6_km[i,1]-res6_km[i,-1]
+    tmp7 <- res7_km[i,1]-res7_km[i,-1]
+    tmp8 <- res8_km[i,1]-res8_km[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_SplatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp4 <- res4_km[i,-1]-res4_km[i,1]
+    tmp5 <- res5_km[i,-1]-res5_km[i,1]
+    tmp6 <- res6_km[i,-1]-res6_km[i,1]
+    tmp7 <- res7_km[i,-1]-res7_km[i,1]
+    tmp8 <- res8_km[i,-1]-res8_km[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("Cellbench","GSE75748","GSE81861","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_SplatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res_km)
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+rename
+```{r}
+res_km_melt$method <- as.character(res_km_melt$method)
+res_km_melt[res_km_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_melt[res_km_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_melt[res_km_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_melt[res_km_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+res_km_median$method <- as.character(res_km_median$method)
+res_km_median[res_km_median$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_median[res_km_median$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_median[res_km_median$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_median[res_km_median$method=="p00001_CLR",]$method <- "P00001_CLR"
+
+rownames(res_km_median)[rownames(res_km_median)=="SGeoMeanS_CLR"] <- "SGM_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p1_CLR"] <- "P1_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p001_CLR"] <- "P001_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="p00001_CLR"] <- "P00001_CLR"
+
+res_km_median_melt$method <- as.character(res_km_median_melt$method)
+res_km_median_melt[res_km_median_melt$method=="SGeoMeanS_CLR",]$method <- "SGM_CLR"
+res_km_median_melt[res_km_median_melt$method=="p1_CLR",]$method <- "P1_CLR"
+res_km_median_melt[res_km_median_melt$method=="p001_CLR",]$method <- "P001_CLR"
+res_km_median_melt[res_km_median_melt$method=="p00001_CLR",]$method <- "P00001_CLR"
+```
+
+heatmap(all datasets&metrics)
+```{r fig.height=3}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_melt$method <- factor(res_km_melt$method,levels=rank1)
+
+tmp_hm <- res_km_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.3),-0.3,tmp_hm$Metrics_Difference)
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference>0.3,0.3,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+all_s_km_hm_ind <- ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(8.5,16.5,24.5),linetype="dashed")+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+all_s_km_hm_ind
+```
+
+
+### combine plots
+4 metrics
+```{r fig.height=5, fig.width=8.5}
+ggarrange(real_s_lv_hm,real_s_km_hm,sim_s_lv_hm,sim_s_km_hm,ncol=2,nrow=2,labels="AUTO")
+```
+
+4 metrics individual data
+```{r fig.height=3.8, fig.width=8.8}
+ggarrange(all_s_lv_hm_ind,all_s_km_hm_ind,ncol=2,nrow=1,labels="AUTO")
+```
+
+4 metrics  -true-lognorm
+```{r fig.height=5, fig.width=4.8}
+ggarrange(simtrue_s_lv_hm,simtrue_s_km_hm,ncol=1,nrow=2,labels="AUTO")
+```
+
+
+# effect of different transformations in clustering
+## GSE75748 cell type
+read data
+```{r message=FALSE, warning=FALSE}
+##bulk
+bulk_dat <- read.csv("GSE75748_bulk_cell_type_ec.csv",header=TRUE,row.names=1)
+bulk_dat <- DGEList(bulk_dat)
+keep <- filterByExpr(bulk_dat)
+bulk_dat <- bulk_dat[keep,,keep.lib.sizes=FALSE]
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta <- c("H1","H1","H1","H1","H9","H9","H9","DEC","DEC","EC","EC","EC","HFF","HFF","HFF","NPC","NPC","TB","TB")
+mm <- model.matrix(~0 + bulk_meta)
+bulk_dat <- voom(bulk_dat,mm,plot=FALSE)$E
+bulk_dat <- data.frame(H1=apply(bulk_dat[,1:4],1,mean),H9=apply(bulk_dat[,5:7],1,mean),DEC=apply(bulk_dat[,8:9],1,mean),EC=apply(bulk_dat[,10:12],1,mean),HFF=apply(bulk_dat[,13:15],1,mean),NPC=apply(bulk_dat[,16:17],1,mean),TB=apply(bulk_dat[,18:19],1,mean))
+
+##raw
+raw_dat <- fread("GSE75748_sc_cell_type_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/GSE75748_sc_cell_type_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/GSE75748_sc_cell_type_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(raw_dat),]
+raw_dat <- raw_dat[rownames(bulk_dat),]
+raw_dat <- raw_dat[,metadat$cell]
+MAGIC_dat <- MAGIC_dat[rownames(bulk_dat),]
+MAGIC_dat <- MAGIC_dat[,metadat$cell]
+alra_dat <- alra_dat[rownames(bulk_dat),]
+alra_dat <- alra_dat[,metadat$cell]
+```
+
+### CoDA
+LR transform (add psuedocount s/gm(s))
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+#Imputation-CLR
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,Raw_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,Raw_ILR=cb_ILR,Raw_HKGLR=raw_coda_ilr)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_coda_ilr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+rm(cb_ILR)
+```
+
+### evaluations
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=7,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_GSE75748.rds")
+```
+
+UMAP lv celltype
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+combine plots UMAP scale
+```{r fig.height=9.6, fig.width=12}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","Raw_mdCLR","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_IQLR_Group","Raw_IQLR","Raw_LVHA_Group","Raw_LVHA","Raw_ILR","Raw_HKGLR")]
+ggarrange(plotlist=p_Scale,ncol=4,nrow=4)
+```
+
+combine plots PCA scale
+```{r fig.height=9.6, fig.width=12}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","Raw_mdCLR","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_IQLR_Group","Raw_IQLR","Raw_LVHA_Group","Raw_LVHA","Raw_ILR","Raw_HKGLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=4,nrow=4)
+```
+
+## GSE81861
+read data
+```{r message=FALSE, warning=FALSE}
+##bulk
+bulk_dat <- readRDS("bulk_of_GSE81861_with_replicates_TPM.rds")
+bulk_dat <- bulk_dat[rowSums(bulk_dat>0)>0,]
+filterGene <- which(apply(bulk_dat,1,max)<5)
+bulk_dat <- bulk_dat[-filterGene,]
+bulk_meta <- c("K562","K562","A549","A549","GM12878","GM12878","K562","K562","IMR90","IMR90","H1","H1","GM12878","GM12878") 
+bulk_dat <- log2(bulk_dat+1)
+
+##raw
+raw_dat <- fread("GSE81861_ENCODE_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/GSE81861_ENCODE_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/GSE81861_ENCODE_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(raw_dat),]
+raw_dat <- raw_dat[rownames(bulk_dat),]
+raw_dat <- raw_dat[,metadat$cell]
+MAGIC_dat <- MAGIC_dat[rownames(bulk_dat),]
+MAGIC_dat <- MAGIC_dat[,metadat$cell]
+alra_dat <- alra_dat[rownames(bulk_dat),]
+alra_dat <- alra_dat[,metadat$cell]
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+#imputation
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,Raw_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,Raw_ILR=cb_ILR,Raw_HKGLR=raw_coda_ilr)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_coda_ilr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+```
+
+### evaluations
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv 
+```{r}
+res2_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res2_lv))
+```
+
+evaluate kmeans
+```{r}
+res2_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res2_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res2_lv,km=res2_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_GSE81861.rds")
+```
+
+UMAP cell type
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA cell type
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+
+## cellbench
+read data
+```{r message=FALSE, warning=FALSE}
+bulk_dat <- readRDS("GSE86337_processed_count_average_replicates.rds")
+
+##raw
+raw_dat <- fread("cellbench_sc_10x_5cl_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/cellbench_sc_10x_5cl_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/cellbench_sc_10x_5cl_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\.")[[1]][2])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(raw_dat),]
+raw_dat <- raw_dat[rownames(bulk_dat),]
+raw_dat <- raw_dat[,metadat$cell]
+MAGIC_dat <- MAGIC_dat[rownames(bulk_dat),]
+MAGIC_dat <- MAGIC_dat[,metadat$cell]
+alra_dat <- alra_dat[rownames(bulk_dat),]
+alra_dat <- alra_dat[,metadat$cell]
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+```
+
+### normalize and combine
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,SGM_ILR=cb_ILR,SGM_HKGLR=raw_coda_ilr)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_coda_ilr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+rm(cb_ILR)
+```
+
+### evaluations
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv 
+```{r}
+res3_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res3_lv))
+```
+
+evaluate kmeans
+```{r}
+res3_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res3_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res3_lv,km=res3_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_cellbench.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+
+for(x in names(datCluster)){
+    # get variance explained
+    tmppca <- datCluster[[x]][["pca"]]
+    total_variance <- tmppca@misc$total.variance
+    # Get the total/top50 variance
+    eigValues <- (tmppca@stdev)^2  ## EigenValues
+    varExplained <- round(eigValues/total_variance*100,2)[1:2] #total
+    #varExplained <- round(eigValues/sum(eigValues)*100,2)[1:2] #top50
+    rm(tmppca)
+    
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)+xlab(paste0("PC1(",varExplained[1],"%)"))+ylab(paste0("PC2(",varExplained[2],"%)"))
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+combine plots UMAP scale
+```{r fig.height=7.2, fig.width=9.9}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","MAGIC_CLR","ALRA_CLR","SGM_CLR","SGM_ILR","SGM_HKGLR")]
+ggarrange(plotlist=p_Scale,ncol=3,nrow=3)
+```
+
+combine plots PCA scale
+```{r fig.height=7.2, fig.width=9.9}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","MAGIC_CLR","ALRA_CLR","SGM_CLR","SGM_ILR","SGM_HKGLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=3,nrow=3)
+```
+
+## sorted PBMC
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("sortedPBMC_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+metadat <- read.table("sortedPBMC_labels.txt",sep="\t",header=FALSE,stringsAsFactors=FALSE)
+metadat$cell <- colnames(raw_dat)
+metadat$celltype <- metadat$V1
+rownames(metadat) <- metadat$cell
+
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/sortedPBMC_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/sortedPBMC_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,SGM_ILR=cb_ILR,SGM_HKGLR=raw_coda_ilr)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_coda_ilr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+rm(cb_ILR)
+
+colnames(dat$ALRA) <- rownames(metadat)
+colnames(dat$ALRA_CLR) <- rownames(metadat)
+```
+
+### evaluations
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=10,scale_data=TRUE)
+```
+
+evaluate lv 
+```{r}
+res7_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res7_lv))
+```
+
+evaluate kmeans
+```{r}
+res7_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res7_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res7_lv,km=res7_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_sortedPBMC.rds")
+```
+
+UMAP lv celltype
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+
+for(x in names(datCluster)){
+    # get variance explained
+    tmppca <- datCluster[[x]][["pca"]]
+    total_variance <- tmppca@misc$total.variance
+    # Get the total/top50 variance
+    eigValues <- (tmppca@stdev)^2  ## EigenValues
+    varExplained <- round(eigValues/total_variance*100,2)[1:2] #total
+    #varExplained <- round(eigValues/sum(eigValues)*100,2)[1:2] #top50
+    rm(tmppca)
+    
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)+xlab(paste0("PC1(",varExplained[1],"%)"))+ylab(paste0("PC2(",varExplained[2],"%)"))
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+combine plots UMAP
+```{r fig.height=7.2, fig.width=9.9}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","MAGIC_CLR","ALRA_CLR","SGM_CLR","SGM_ILR","SGM_HKGLR")]
+ggarrange(plotlist=p_Scale,ncol=3,nrow=3)
+```
+
+combine plots PCA
+```{r fig.height=7.2, fig.width=9.9}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","MAGIC_CLR","ALRA_CLR","SGM_CLR","SGM_ILR","SGM_HKGLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=3,nrow=3)
+```
+
+## summary and visualization(real)
+```{r}
+d1 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE75748.rds")
+d2 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE81861.rds")
+d3 <- readRDS("results/Clustering/SC_Clustering_EvalRes_cellbench.rds")
+d4 <- readRDS("results/Clustering/SC_Clustering_EvalRes_sortedPBMC.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res2_lv$Raw_LVHA_Group <- NA
+res3_lv <- d3$lv
+res4_lv <- d4$lv
+
+res2_lv <- res2_lv[,colnames(res1_lv)]
+res3_lv <- res3_lv[,colnames(res3_lv)]
+res4_lv <- res4_lv[,colnames(res4_lv)]
+
+res1_km <- d1$km
+res2_km <- d2$km
+res2_km$Raw_LVHA_Group <- NA
+res3_km <- d3$km
+res4_km <- d4$km
+
+res2_km <- res2_km[,colnames(res1_km)]
+res3_km <- res3_km[,colnames(res3_km)]
+res4_km <- res4_km[,colnames(res4_km)]
+```
+
+#### process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp4 <- res4_lv[i,1]-res4_lv[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp4 <- res4_lv[i,-1]-res4_lv[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res_lv)
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+filter and rename
+```{r}
+res_lv_melt$method <- as.character(res_lv_melt$method)
+res_lv_melt <- res_lv_melt[res_lv_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_melt[res_lv_melt$method=="Raw_SCT",]$method <- "SCT"
+res_lv_melt[res_lv_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_melt[res_lv_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_lv_melt[res_lv_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+res_lv_median$method <- as.character(res_lv_median$method)
+res_lv_median <- res_lv_median[res_lv_median$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_median[res_lv_median$method=="Raw_SCT",]$method <- "SCT"
+res_lv_median[res_lv_median$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_median[res_lv_median$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_lv_median[res_lv_median$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_SCT"] <- "SCT"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_CLR"] <- "SGM_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_ILR"] <- "SGM_ILR"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_HKGLR"] <- "SGM_HKGLR"
+
+res_lv_median_melt$method <- as.character(res_lv_median_melt$method)
+res_lv_median_melt <- res_lv_median_melt[res_lv_median_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_median_melt[res_lv_median_melt$method=="Raw_SCT",]$method <- "SCT"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.025),]$Metrics_Difference <- -0.025
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+mix_s_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)(real data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+mix_s_lv_hm
+```
+
+#### process data(kmeans)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp4 <- res4_km[i,1]-res4_km[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp4 <- res4_km[i,-1]-res4_km[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res_km)
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+filter and rename
+```{r}
+res_km_melt$method <- as.character(res_km_melt$method)
+res_km_melt <- res_km_melt[res_km_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_melt[res_km_melt$method=="Raw_SCT",]$method <- "SCT"
+res_km_melt[res_km_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_melt[res_km_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_km_melt[res_km_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+res_km_median$method <- as.character(res_km_median$method)
+res_km_median <- res_km_median[res_km_median$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_median[res_km_median$method=="Raw_SCT",]$method <- "SCT"
+res_km_median[res_km_median$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_median[res_km_median$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_km_median[res_km_median$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+rownames(res_km_median)[rownames(res_km_median)=="Raw_SCT"] <- "SCT"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_CLR"] <- "SGM_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_ILR"] <- "SGM_ILR"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_HKGLR"] <- "SGM_HKGLR"
+
+res_km_median_melt$method <- as.character(res_km_median_melt$method)
+res_km_median_melt <- res_km_median_melt[res_km_median_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_median_melt[res_km_median_melt$method=="Raw_SCT",]$method <- "SCT"
+res_km_median_melt[res_km_median_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_median_melt[res_km_median_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_km_median_melt[res_km_median_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+
+tmp_hm <- res_km_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.05),]$Metrics_Difference <- -0.05
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+mix_s_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)(real data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+mix_s_km_hm
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout43
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+
+##True dat
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+true_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+true_coda_clr <- log2(true_coda_clr)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+
+## truedat
+true_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+true_lognorm <- NormalizeData(true_lognorm)
+true_lognorm <- as.matrix(true_lognorm@assays$RNA@data)
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,Raw_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,Raw_ILR=cb_ILR,True_LogNorm=true_lognorm,True_CLR=true_coda_clr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+rm(true_lognorm)
+rm(true_coda_clr)
+rm(cb_ILR)
+```
+
+### evaluations
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout43.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+
+##True dat
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+true_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+true_coda_clr <- log2(true_coda_clr)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+
+true_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+true_lognorm <- NormalizeData(true_lognorm)
+true_lognorm <- as.matrix(true_lognorm@assays$RNA@data)
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,SGM_ILR=cb_ILR,True_LogNorm=true_lognorm,True_CLR=true_coda_clr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+rm(true_lognorm)
+rm(true_coda_clr)
+rm(cb_ILR)
+```
+
+### evaluations
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout68.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+
+for(x in names(datCluster)){
+    # get variance explained
+    tmppca <- datCluster[[x]][["pca"]]
+    total_variance <- tmppca@misc$total.variance
+    # Get the total/top50 variance
+    eigValues <- (tmppca@stdev)^2  ## EigenValues
+    varExplained <- round(eigValues/total_variance*100,2)[1:2] #total
+    #varExplained <- round(eigValues/sum(eigValues)*100,2)[1:2] #top50
+    rm(tmppca)
+    
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)+scale_color_manual(values=selected_palette)+xlab(paste0("PC1(",varExplained[1],"%)"))+ylab(paste0("PC2(",varExplained[2],"%)"))
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+combine plots UMAP
+```{r fig.height=7.2, fig.width=12}
+p_Scale <- p_Scale[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","SGM_CLR","SGM_ILR","ALRA_CLR","MAGIC_CLR","True_LogNorm","True_CLR")]
+ggarrange(plotlist=p_Scale,ncol=4,nrow=3)
+```
+
+combine plots PCA
+```{r fig.height=7.2, fig.width=12}
+p_Scale_pca <- p_Scale_pca[c("Raw_LogNorm","Raw_SCT","ALRA","MAGIC","SGM_CLR","SGM_ILR","ALRA_CLR","MAGIC_CLR","True_LogNorm","True_CLR")]
+ggarrange(plotlist=p_Scale_pca,ncol=4,nrow=3)
+```
+
+## Sim_CB10x5cl_G10kC1500_5UGroup_dropout92
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+
+##True dat
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+true_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+true_coda_clr <- log2(true_coda_clr)
+```
+
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+
+true_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+true_lognorm <- NormalizeData(true_lognorm)
+true_lognorm <- as.matrix(true_lognorm@assays$RNA@data)
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,Raw_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,Raw_ILR=cb_ILR,True_LogNorm=true_lognorm,True_CLR=true_coda_clr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+rm(true_lognorm)
+rm(true_coda_clr)
+rm(cb_ILR)
+```
+
+### evaluations
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout92.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+
+## Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("imputed/MAGIC_log/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("imputed/alra/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+
+metadat <- readRDS("Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- rownames(metadat)
+metadat$celltype <- metadat$Group
+
+metadat$G_C <- NA
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition1",]$G_C <- "G1C1"
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition2",]$G_C <- "G1C2"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition1",]$G_C <- "G2C1"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition2",]$G_C <- "G2C2"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition1",]$G_C <- "G3C1"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition2",]$G_C <- "G3C2"
+
+colnames(raw_dat) <- metadat$cell
+colnames(truedat) <- metadat$cell
+colnames(MAGIC_dat) <- metadat$cell
+colnames(alra_dat) <- metadat$cell
+
+rownames(raw_dat) <- sub("_","-",rownames(raw_dat))
+rownames(truedat) <- sub("_","-",rownames(truedat))
+rownames(MAGIC_dat) <- sub("_","-",rownames(MAGIC_dat))
+rownames(alra_dat) <- sub("_","-",rownames(alra_dat))
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+magiclog_coda_clr <- apply(MAGIC_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp))))
+cb_ILR <- cb_ILR[,colnames(raw_dat)]
+
+##True dat
+tmp <- as.matrix(truedat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+true_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+true_coda_clr <- log2(true_coda_clr)
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+
+true_lognorm <- CreateSeuratObject(counts=truedat,meta.data=metadat,min.cells=0,min.features=0)
+true_lognorm <- NormalizeData(true_lognorm)
+true_lognorm <- as.matrix(true_lognorm@assays$RNA@data)
+```
+
+combine data
+```{r}
+dat <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIC_dat,Raw_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,Raw_ILR=cb_ILR,True_LogNorm=true_lognorm,True_CLR=true_coda_clr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIC_dat)
+rm(raw_coda_clr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+rm(true_lognorm)
+rm(true_coda_clr)
+rm(cb_ILR)
+```
+
+### evaluations
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=6,scale_data=TRUE)
+```
+
+```{r}
+evalClustering_tmp <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"G_C"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$G_C),function(sct){
+        p <- table(x@meta.data[x$G_C==sct,method])/sum(x$G_C==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$G_C,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$G_C)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+```
+
+evaluate lv
+```{r}
+res9_lv_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp))
+as.data.frame(t(res9_lv_6g))
+```
+
+evaluate km
+```{r}
+res9_km_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp,method="kmeans"))
+as.data.frame(t(res9_km_6g))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv6g=res9_lv_6g,km6g=res9_km_6g)
+saveRDS(all_res,"results/Clustering/SC_Clustering_EvalRes_Sim_splatPop_dropout90.rds")
+```
+
+UMAP cell type
+```{r fig.height=7.5, fig.width=12}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="G_C")+ggtitle(x)
+    #print(p)
+    p_Scale[[x]] <- p
+}
+
+ggarrange(plotlist=p_Scale,ncol=4,nrow=3)
+```
+
+PCA cell type
+```{r fig.height=7.5, fig.width=12}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="G_C")+ggtitle(x)
+    #print(p)
+    p_Scale_pca[[x]] <- p
+}
+ggarrange(plotlist=p_Scale_pca,ncol=4,nrow=3)
+```
+
+
+## summary and visualization(simulated)
+read data
+```{r}
+d1 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout43.rds")
+d2 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout68.rds")
+d3 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout92.rds")
+d4 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_splatPop_dropout90.rds")
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res3_lv <- d3$lv
+res4_lv <- d4$lv6g
+
+res1_km <- d1$km
+res2_km <- d2$km
+res3_km <- d3$km
+res4_km <- d4$km6g
+
+res3_lv$Raw_LVHA_Group <- NA
+res3_km$Raw_LVHA_Group <- NA
+
+res2_lv <- res2_lv[,colnames(res1_lv)]
+res3_lv <- res3_lv[,colnames(res1_lv)]
+res4_lv <- res4_lv[,colnames(res1_lv)]
+
+res2_km <- res2_km[,colnames(res1_km)]
+res3_km <- res3_km[,colnames(res1_km)]
+res4_km <- res4_km[,colnames(res1_km)]
+```
+
+### diff between raw lognorm
+#### process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp4 <- res4_lv[i,1]-res4_lv[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp4 <- res4_lv[i,-1]-res4_lv[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res1_lv)[-1]
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+filter and rename
+```{r}
+res_lv_melt$method <- as.character(res_lv_melt$method)
+res_lv_melt <- res_lv_melt[res_lv_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_melt[res_lv_melt$method=="Raw_SCT",]$method <- "SCT"
+res_lv_melt[res_lv_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_melt[res_lv_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+#res_lv_melt[res_lv_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+res_lv_median$method <- as.character(res_lv_median$method)
+res_lv_median <- res_lv_median[res_lv_median$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_median[res_lv_median$method=="Raw_SCT",]$method <- "SCT"
+res_lv_median[res_lv_median$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_median[res_lv_median$method=="Raw_ILR",]$method <- "SGM_ILR"
+#res_lv_median[res_lv_median$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_SCT"] <- "SCT"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_CLR"] <- "SGM_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_ILR"] <- "SGM_ILR"
+#rownames(res_lv_median)[rownames(res_lv_median)=="Raw_HKGLR"] <- "SGM_HKGLR"
+
+res_lv_median_melt$method <- as.character(res_lv_median_melt$method)
+res_lv_median_melt <- res_lv_median_melt[res_lv_median_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_median_melt[res_lv_median_melt$method=="Raw_SCT",]$method <- "SCT"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+#res_lv_median_melt[res_lv_median_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[,]
+tmp_hm <- tmp_hm[!tmp_hm$method%in%c("True_LogNorm","True_CLR"),]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.2),]$Metrics_Difference <- -0.2
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+sim_s_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)(simluated data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+sim_s_lv_hm
+```
+
+#### process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp4 <- res4_km[i,1]-res4_km[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp4 <- res4_km[i,-1]-res4_km[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res1_km)[-1]
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+filter and rename
+```{r}
+res_km_melt$method <- as.character(res_km_melt$method)
+res_km_melt <- res_km_melt[res_km_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_melt[res_km_melt$method=="Raw_SCT",]$method <- "SCT"
+res_km_melt[res_km_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_melt[res_km_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+#res_km_melt[res_km_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+res_km_median$method <- as.character(res_km_median$method)
+res_km_median <- res_km_median[res_km_median$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_median[res_km_median$method=="Raw_SCT",]$method <- "SCT"
+res_km_median[res_km_median$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_median[res_km_median$method=="Raw_ILR",]$method <- "SGM_ILR"
+#res_km_median[res_km_median$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+rownames(res_km_median)[rownames(res_km_median)=="Raw_SCT"] <- "SCT"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_CLR"] <- "SGM_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_ILR"] <- "SGM_ILR"
+#rownames(res_km_median)[rownames(res_km_median)=="Raw_HKGLR"] <- "SGM_HKGLR"
+
+res_km_median_melt$method <- as.character(res_km_median_melt$method)
+res_km_median_melt <- res_km_median_melt[res_km_median_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_median_melt[res_km_median_melt$method=="Raw_SCT",]$method <- "SCT"
+res_km_median_melt[res_km_median_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_median_melt[res_km_median_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+#res_km_median_melt[res_km_median_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+
+tmp_hm <- res_km_median_melt[,]
+tmp_hm <- tmp_hm[!tmp_hm$method%in%c("True_LogNorm","True_CLR"),]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.2),]$Metrics_Difference <- -0.2
+tmp_hm[tmp_hm$Metrics_Difference>(0.25),]$Metrics_Difference <- 0.25
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+sim_s_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)(simulated data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+sim_s_km_hm
+```
+
+### diff between true lognorm
+#### process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+rownames(res2_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+rownames(res3_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+rownames(res4_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,ncol(res1_lv)-1]-res1_lv[i,-(ncol(res1_lv)-1)]
+    tmp2 <- res2_lv[i,ncol(res1_lv)-1]-res2_lv[i,-(ncol(res1_lv)-1)]
+    tmp3 <- res3_lv[i,ncol(res1_lv)-1]-res3_lv[i,-(ncol(res1_lv)-1)]
+    tmp4 <- res4_lv[i,ncol(res1_lv)-1]-res4_lv[i,-(ncol(res1_lv)-1)]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-(ncol(res1_lv)-1)]-res1_lv[i,ncol(res1_lv)-1]
+    tmp2 <- res2_lv[i,-(ncol(res1_lv)-1)]-res2_lv[i,ncol(res1_lv)-1]
+    tmp3 <- res3_lv[i,-(ncol(res1_lv)-1)]-res3_lv[i,ncol(res1_lv)-1]
+    tmp4 <- res4_lv[i,-(ncol(res1_lv)-1)]-res4_lv[i,ncol(res1_lv)-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+#rownames(res_lv_median) <- colnames(res1_lv)[-(ncol(res1_lv)-1)]
+rownames(res_lv_median) <- colnames(tmp1)
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.2),]$Metrics_Difference <- -0.2
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+sim_s_lv_minustrue_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)(simluated data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+sim_s_lv_minustrue_hm
+```
+
+#### process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,ncol(res1_km)-1]-res1_km[i,-(ncol(res1_km)-1)]
+    tmp2 <- res2_km[i,ncol(res1_km)-1]-res2_km[i,-(ncol(res1_km)-1)]
+    tmp3 <- res3_km[i,ncol(res1_km)-1]-res3_km[i,-(ncol(res1_km)-1)]
+    tmp4 <- res4_km[i,ncol(res1_km)-1]-res4_km[i,-(ncol(res1_km)-1)]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-(ncol(res1_km)-1)]-res1_km[i,ncol(res1_km)-1]
+    tmp2 <- res2_km[i,-(ncol(res1_km)-1)]-res2_km[i,ncol(res1_km)-1]
+    tmp3 <- res3_km[i,-(ncol(res1_km)-1)]-res3_km[i,ncol(res1_km)-1]
+    tmp4 <- res4_km[i,-(ncol(res1_km)-1)]-res4_km[i,ncol(res1_km)-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("SimDat1","SimDat2","SimDat3","SimDat4"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(tmp1)
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+heatmap
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+
+tmp_hm <- res_km_median_melt[,]
+
+tmp_hm[tmp_hm$Metrics_Difference<(-0.4),]$Metrics_Difference <- -0.4
+#tmp_hm[tmp_hm$Metrics_Difference>(0.25),]$Metrics_Difference <- 0.25
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+sim_s_km_minustrue_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)(simulated data)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")
+sim_s_km_minustrue_hm
+```
+
+## CoDA summary for individual real and simulated datasets
+read data
+```{r}
+d1 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE75748.rds")
+d2 <- readRDS("results/Clustering/SC_Clustering_EvalRes_GSE81861.rds")
+d3 <- readRDS("results/Clustering/SC_Clustering_EvalRes_cellbench.rds")
+d4 <- readRDS("results/Clustering/SC_Clustering_EvalRes_sortedPBMC.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res3_lv <- d3$lv
+res4_lv <- d4$lv
+
+res1_km <- d1$km
+res2_km <- d2$km
+res3_km <- d3$km
+res4_km <- d4$km
+
+res2_lv$Raw_LVHA_Group <- NA
+res2_km$Raw_LVHA_Group <- NA
+
+res2_lv <- res2_lv[,colnames(res1_lv)]
+res3_lv <- res3_lv[,colnames(res1_lv)]
+res4_lv <- res4_lv[,colnames(res1_lv)]
+
+res2_km <- res2_km[,colnames(res1_km)]
+res3_km <- res3_km[,colnames(res1_km)]
+res4_km <- res4_km[,colnames(res1_km)]
+
+###Sim
+d5 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout43.rds")
+d6 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout68.rds")
+d7 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_CB10x5cl_dropout92.rds")
+d8 <- readRDS("results/Clustering/SC_Clustering_EvalRes_Sim_splatPop_dropout90.rds")
+res5_lv <- d5$lv
+res6_lv <- d6$lv
+res7_lv <- d7$lv
+res8_lv <- d8$lv6g
+
+res5_km <- d5$km
+res6_km <- d6$km
+res7_km <- d7$km
+res8_km <- d8$km6g
+
+res7_lv$Raw_LVHA_Group <- NA
+res7_km$Raw_LVHA_Group <- NA
+
+res5_lv$Raw_HKGLR  <- NA
+res5_lv <- res5_lv[,colnames(res1_lv)]
+res6_lv$Raw_HKGLR  <- NA
+res6_lv <- res6_lv[,colnames(res1_lv)]
+res7_lv$Raw_HKGLR  <- NA
+res7_lv <- res7_lv[,colnames(res1_lv)]
+res8_lv$Raw_HKGLR  <- NA
+res8_lv <- res8_lv[,colnames(res1_lv)]
+
+res5_km$Raw_HKGLR  <- NA
+res5_km <- res5_km[,colnames(res1_km)]
+res6_km$Raw_HKGLR  <- NA
+res6_km <- res6_km[,colnames(res1_km)]
+res7_km$Raw_HKGLR  <- NA
+res7_km <- res7_km[,colnames(res1_km)]
+res8_km$Raw_HKGLR  <- NA
+res8_km <- res8_km[,colnames(res1_km)]
+```
+
+### process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp4 <- res4_lv[i,1]-res4_lv[i,-1]
+    tmp5 <- res5_lv[i,1]-res5_lv[i,-1]
+    tmp6 <- res6_lv[i,1]-res6_lv[i,-1]
+    tmp7 <- res7_lv[i,1]-res7_lv[i,-1]
+    tmp8 <- res8_lv[i,1]-res8_lv[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_SplatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp4 <- res4_lv[i,-1]-res4_lv[i,1]
+    tmp5 <- res5_lv[i,-1]-res5_lv[i,1]
+    tmp6 <- res6_lv[i,-1]-res6_lv[i,1]
+    tmp7 <- res7_lv[i,-1]-res7_lv[i,1]
+    tmp8 <- res8_lv[i,-1]-res8_lv[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_SplatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res_lv)
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+filter and rename
+```{r}
+res_lv_melt$method <- as.character(res_lv_melt$method)
+res_lv_melt <- res_lv_melt[res_lv_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_melt[res_lv_melt$method=="Raw_SCT",]$method <- "SCT"
+res_lv_melt[res_lv_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_melt[res_lv_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_lv_melt[res_lv_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+res_lv_median$method <- as.character(res_lv_median$method)
+res_lv_median <- res_lv_median[res_lv_median$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_median[res_lv_median$method=="Raw_SCT",]$method <- "SCT"
+res_lv_median[res_lv_median$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_median[res_lv_median$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_lv_median[res_lv_median$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_SCT"] <- "SCT"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_CLR"] <- "SGM_CLR"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_ILR"] <- "SGM_ILR"
+rownames(res_lv_median)[rownames(res_lv_median)=="Raw_HKGLR"] <- "SGM_HKGLR"
+
+res_lv_median_melt$method <- as.character(res_lv_median_melt$method)
+res_lv_median_melt <- res_lv_median_melt[res_lv_median_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_lv_median_melt[res_lv_median_melt$method=="Raw_SCT",]$method <- "SCT"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_lv_median_melt[res_lv_median_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+```
+
+heatmap(all datasets&metrics)
+```{r fig.height=3}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_melt$method <- factor(res_lv_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.15),-0.15,tmp_hm$Metrics_Difference)
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference>0.15,0.15,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+all_s_lv_hm_ind <- ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(8.5,16.5,24.5),linetype="dashed")+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14))+xlab("Method")
+all_s_lv_hm_ind
+```
+
+### process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp4 <- res4_km[i,1]-res4_km[i,-1]
+    tmp5 <- res5_km[i,1]-res5_km[i,-1]
+    tmp6 <- res6_km[i,1]-res6_km[i,-1]
+    tmp7 <- res7_km[i,1]-res7_km[i,-1]
+    tmp8 <- res8_km[i,1]-res8_km[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_splatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp4 <- res4_km[i,-1]-res4_km[i,1]
+    tmp5 <- res5_km[i,-1]-res5_km[i,1]
+    tmp6 <- res6_km[i,-1]-res6_km[i,1]
+    tmp7 <- res7_km[i,-1]-res7_km[i,1]
+    tmp8 <- res8_km[i,-1]-res8_km[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6,tmp7,tmp8)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench","sortedPBMC","Sim1_43","Sim2_68","Sim3_90","Sim4_splatPop_92"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res_km)
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+filter and rename
+```{r}
+res_km_melt$method <- as.character(res_km_melt$method)
+res_km_melt <- res_km_melt[res_km_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_melt[res_km_melt$method=="Raw_SCT",]$method <- "SCT"
+res_km_melt[res_km_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_melt[res_km_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_km_melt[res_km_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+res_km_median$method <- as.character(res_km_median$method)
+res_km_median <- res_km_median[res_km_median$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_median[res_km_median$method=="Raw_SCT",]$method <- "SCT"
+res_km_median[res_km_median$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_median[res_km_median$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_km_median[res_km_median$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+
+rownames(res_km_median)[rownames(res_km_median)=="Raw_SCT"] <- "SCT"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_CLR"] <- "SGM_CLR"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_ILR"] <- "SGM_ILR"
+rownames(res_km_median)[rownames(res_km_median)=="Raw_HKGLR"] <- "SGM_HKGLR"
+
+res_km_median_melt$method <- as.character(res_km_median_melt$method)
+res_km_median_melt <- res_km_median_melt[res_km_median_melt$method%in%c("Raw_SCT","ALRA","MAGIC","Raw_CLR","ALRA_CLR","MAGIC_CLR","Raw_ILR","Raw_HKGLR"),]
+res_km_median_melt[res_km_median_melt$method=="Raw_SCT",]$method <- "SCT"
+res_km_median_melt[res_km_median_melt$method=="Raw_CLR",]$method <- "SGM_CLR"
+res_km_median_melt[res_km_median_melt$method=="Raw_ILR",]$method <- "SGM_ILR"
+res_km_median_melt[res_km_median_melt$method=="Raw_HKGLR",]$method <- "SGM_HKGLR"
+```
+
+heatmap(all datasets&metrics)
+```{r fig.height=3}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_melt$method <- factor(res_km_melt$method,levels=rank1)
+
+tmp_hm <- res_km_melt[,]
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.3),-0.3,tmp_hm$Metrics_Difference)
+tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference>0.3,0.3,tmp_hm$Metrics_Difference)
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+all_s_km_hm_ind <- ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(8.5,16.5,24.5),linetype="dashed")+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=17),axis.text.x=element_text(angle=90,size=14))+xlab("Method")
+all_s_km_hm_ind
+```
+
+combine plots
+4 metrics -raw-lognorm
+```{r fig.height=5, fig.width=8.5}
+ggarrange(mix_s_lv_hm,mix_s_km_hm,sim_s_lv_hm,sim_s_km_hm,ncol=2,nrow=2,labels="AUTO")
+```
+
+4 metrics -true-lognorm
+```{r fig.height=5, fig.width=4.2}
+ggarrange(sim_s_lv_minustrue_hm,sim_s_km_minustrue_hm,ncol=1,nrow=2,labels="AUTO")
+```
+
+4 metrics -raw-lognorm individual data
+```{r fig.height=3, fig.width=8}
+ggarrange(all_s_lv_hm_ind,all_s_km_hm_ind,ncol=2,nrow=1,labels="AUTO")
+```
+
+
+
+# LRA
+## CellBench10X5CL
+read and process
+```{r}
+bulk_dat <- readRDS("GSE86337_processed_count_average_replicates.rds")
+
+##raw
+dat <- fread("cellbench_sc_10x_5cl_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dat <- as.matrix(dat,rownames=1)
+
+metadat <- sapply(colnames(dat),function(x) strsplit(x,"\\.")[[1]][2])
+metadat <- data.frame(cell=colnames(dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat),]
+dat <- dat[rownames(bulk_dat),]
+
+#raw lognorm
+dat <- CreateSeuratObject(dat,meta.data=metadat,min.cells=0,min.features=0)
+dat <- NormalizeData(dat)
+dat <- FindVariableFeatures(dat,nfeatures=3000)
+dat <- ScaleData(dat)
+dat <- RunPCA(dat)
+dat <- RunUMAP(dat,dims=1:50)
+```
+
+### LRA vs. CLR+partial SVD
+```{r}
+#CLR+partial SVD
+#add pseudocount s/gm to raw count
+CLRPCA <- as.matrix(dat@assays$RNA@counts[dat@assays$RNA@var.features,])
+gm_s <- exp(mean(log(apply(CLRPCA,2,sum))))
+CLRPCA <- apply(CLRPCA,2,function(x) x+(sum(x)/gm_s) )
+CLRPCA <- t(CLOSE(t(CLRPCA)))
+CLRPCA <- apply(CLRPCA,2,function(x) x/exp(mean(log(x))) )
+CLRPCA <- log(CLRPCA)
+CLRPCA <- CreateSeuratObject(CLRPCA,meta.data=dat@meta.data,min.cells=0,min.features=0)
+CLRPCA <- ScaleData(CLRPCA,features=rownames(CLRPCA))
+CLRPCA <- RunPCA(CLRPCA,features=rownames(CLRPCA))
+CLRPCA <- RunUMAP(CLRPCA,dims=1:10)
+
+#LRA
+tmp_forLRA <- as.matrix(dat@assays$RNA@counts[dat@assays$RNA@var.features,])
+gm_s <- exp(mean(log(apply(tmp_forLRA,2,sum))))
+tmp_forLRA <- apply(tmp_forLRA,2,function(x) x+(sum(x)/gm_s) )
+tmp_forLRA <- CLOSE(t(tmp_forLRA))
+tmp3.uwLRA <- LRA(tmp_forLRA,weight=FALSE)
+```
+
+plots(2 principle coordinate)
+```{r fig.height=4, fig.width=7}
+dat_forLRA <- dat
+CellEmbedRow <- rownames(dat_forLRA@reductions$pca@cell.embeddings)
+CellEmbedCol <- colnames(dat_forLRA@reductions$pca@cell.embeddings)
+FeaLoadRow <- rownames(dat_forLRA@reductions$pca@feature.loadings)
+FeaLoadCol <- colnames(dat_forLRA@reductions$pca@feature.loadings)
+
+dat_forLRA@reductions$pca@stdev <- tmp3.uwLRA$sv
+
+dat_forLRA@reductions$pca@cell.embeddings <- tmp3.uwLRA$rowpcoord[,1:50]
+rownames(dat_forLRA@reductions$pca@cell.embeddings) <- CellEmbedRow
+colnames(dat_forLRA@reductions$pca@cell.embeddings) <- CellEmbedCol
+
+dat_forLRA@reductions$pca@feature.loadings <- tmp3.uwLRA$colpcoord[,1:50]
+rownames(dat_forLRA@reductions$pca@feature.loadings) <- FeaLoadRow
+colnames(dat_forLRA@reductions$pca@feature.loadings) <- FeaLoadCol
+
+dat_forLRA <- RunUMAP(dat_forLRA,dims=1:10)
+
+
+p3 <- DimPlot(CLRPCA,group.by="celltype",label=TRUE,repel=TRUE,reduction="pca")+ggtitle("SGM_CLR+partial SVD")+NoLegend()+scale_color_manual(values=selected_palette)
+p4 <- DimPlot(dat_forLRA,group.by="celltype",label=TRUE,repel=TRUE,reduction="pca")+ggtitle("LRA(easyCODA)")+NoLegend()+xlab("Dimension 1")+ylab("Dimension 2")+scale_color_manual(values=selected_palette)
+
+p1 <- DimPlot(CLRPCA,group.by="celltype",label=TRUE,repel=TRUE,reduction="umap")+ggtitle("SGM_CLR+partial SVD")+NoLegend()+scale_color_manual(values=selected_palette)
+p2 <- DimPlot(dat_forLRA,group.by="celltype",label=TRUE,repel=TRUE,reduction="umap")+ggtitle("LRA(easyCODA)")+NoLegend()+scale_color_manual(values=selected_palette)
+
+p5 <- ElbowPlot(CLRPCA)
+p6 <- ElbowPlot(dat_forLRA)+ylab("Singular Values")
+
+ggarrange(p3,p5,p1,p4,p6,p2,nrow=2,ncol=3)
+```
+
+## GSE75748
+```{r}
+##bulk
+bulk_dat <- read.csv("GSE75748_bulk_cell_type_ec.csv",header=TRUE,row.names=1)
+bulk_dat <- DGEList(bulk_dat)
+keep <- filterByExpr(bulk_dat)
+bulk_dat <- bulk_dat[keep,,keep.lib.sizes=FALSE]
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta <- c("H1","H1","H1","H1","H9","H9","H9","DEC","DEC","EC","EC","EC","HFF","HFF","HFF","NPC","NPC","TB","TB")
+mm <- model.matrix(~0 + bulk_meta)
+bulk_dat <- voom(bulk_dat,mm,plot=FALSE)$E
+bulk_dat <- data.frame(H1=apply(bulk_dat[,1:4],1,mean),H9=apply(bulk_dat[,5:7],1,mean),DEC=apply(bulk_dat[,8:9],1,mean),EC=apply(bulk_dat[,10:12],1,mean),HFF=apply(bulk_dat[,13:15],1,mean),NPC=apply(bulk_dat[,16:17],1,mean),TB=apply(bulk_dat[,18:19],1,mean))
+
+##raw
+dat <- fread("GSE75748_sc_cell_type_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dat <- as.matrix(dat,rownames=1)
+
+metadat <- sapply(colnames(dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat),]
+dat <- dat[rownames(bulk_dat),]
+
+#raw lognorm
+dat <- CreateSeuratObject(dat,meta.data=metadat,min.cells=0,min.features=0)
+dat <- NormalizeData(dat)
+dat <- FindVariableFeatures(dat,nfeatures=3000)
+dat <- ScaleData(dat)
+dat <- RunPCA(dat)
+dat <- RunUMAP(dat,dims=1:10)
+```
+
+### LRA vs. CLR+partial SVD
+```{r}
+#CLR+partial SVD
+#add pseudocount s/gm to raw count
+CLRPCA <- as.matrix(dat@assays$RNA@counts[dat@assays$RNA@var.features,])
+gm_s <- exp(mean(log(apply(CLRPCA,2,sum))))
+CLRPCA <- apply(CLRPCA,2,function(x) x+(sum(x)/gm_s) )
+CLRPCA <- t(CLOSE(t(CLRPCA)))
+CLRPCA <- apply(CLRPCA,2,function(x) x/exp(mean(log(x))) )
+CLRPCA <- log(CLRPCA)
+CLRPCA <- CreateSeuratObject(CLRPCA,meta.data=dat@meta.data,min.cells=0,min.features=0)
+CLRPCA <- ScaleData(CLRPCA,features=rownames(CLRPCA))
+CLRPCA <- RunPCA(CLRPCA,features=rownames(CLRPCA))
+CLRPCA <- RunUMAP(CLRPCA,dims=1:10)
+
+#LRA
+tmp_forLRA <- as.matrix(dat@assays$RNA@counts[dat@assays$RNA@var.features,])
+gm_s <- exp(mean(log(apply(tmp_forLRA,2,sum))))
+tmp_forLRA <- apply(tmp_forLRA,2,function(x) x+(sum(x)/gm_s) )
+tmp_forLRA <- CLOSE(t(tmp_forLRA))
+tmp3.uwLRA <- LRA(tmp_forLRA,weight=FALSE)
+```
+
+plots(2 principle coordinate)
+```{r fig.height=4, fig.width=7}
+dat_forLRA <- dat
+CellEmbedRow <- rownames(dat_forLRA@reductions$pca@cell.embeddings)
+CellEmbedCol <- colnames(dat_forLRA@reductions$pca@cell.embeddings)
+FeaLoadRow <- rownames(dat_forLRA@reductions$pca@feature.loadings)
+FeaLoadCol <- colnames(dat_forLRA@reductions$pca@feature.loadings)
+
+dat_forLRA@reductions$pca@stdev <- tmp3.uwLRA$sv
+
+dat_forLRA@reductions$pca@cell.embeddings <- tmp3.uwLRA$rowpcoord[,1:50]
+rownames(dat_forLRA@reductions$pca@cell.embeddings) <- CellEmbedRow
+colnames(dat_forLRA@reductions$pca@cell.embeddings) <- CellEmbedCol
+
+dat_forLRA@reductions$pca@feature.loadings <- tmp3.uwLRA$colpcoord[,1:50]
+rownames(dat_forLRA@reductions$pca@feature.loadings) <- FeaLoadRow
+colnames(dat_forLRA@reductions$pca@feature.loadings) <- FeaLoadCol
+
+dat_forLRA <- RunUMAP(dat_forLRA,dims=1:10)
+
+
+p3 <- DimPlot(CLRPCA,group.by="celltype",label=TRUE,repel=TRUE,reduction="pca")+ggtitle("SGM_CLR+partial SVD")+NoLegend()+scale_color_manual(values=selected_palette)
+p4 <- DimPlot(dat_forLRA,group.by="celltype",label=TRUE,repel=TRUE,reduction="pca")+ggtitle("LRA(easyCODA)")+NoLegend()+xlab("Dimension 1")+ylab("Dimension 2")+scale_color_manual(values=selected_palette)
+
+p1 <- DimPlot(CLRPCA,group.by="celltype",label=TRUE,repel=TRUE,reduction="umap")+ggtitle("SGM_CLR+partial SVD")+NoLegend()+scale_color_manual(values=selected_palette)
+p2 <- DimPlot(dat_forLRA,group.by="celltype",label=TRUE,repel=TRUE,reduction="umap")+ggtitle("LRA(easyCODA)")+NoLegend()+scale_color_manual(values=selected_palette)
+
+p5 <- ElbowPlot(CLRPCA)
+p6 <- ElbowPlot(dat_forLRA)+ylab("Singular Values")
+
+ggarrange(p3,p5,p1,p4,p6,p2,nrow=2,ncol=3)
+```

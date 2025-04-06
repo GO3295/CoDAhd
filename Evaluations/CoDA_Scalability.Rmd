@@ -1,0 +1,753 @@
+---
+title: "CoDA_Scalability"
+output: html_document
+---
+
+library
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(Seurat)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(robCompositions)
+library(easyCODA)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(scmap)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(MatrixCorrelation)
+library(scater)
+library(Hmisc)
+library(peakRAM)
+```
+
+clustering functions
+```{r message=FALSE, warning=FALSE}
+getCluster <- function(x,meta,reso=0.01,npc=10,cent=4,scale_data=FALSE){
+    tmp <- CreateSeuratObject(counts=x,meta.data=meta,min.cells=0,min.features=0)
+    tmp <- FindVariableFeatures(tmp,nfeatures=3000,verbose=FALSE)
+    if(scale_data){
+        tmp <- ScaleData(tmp,verbose=FALSE)
+    }else{
+        tmp[["RNA"]]@scale.data <- as.matrix(tmp[["RNA"]]@counts[VariableFeatures(tmp),])
+    }
+    tmp <- RunPCA(tmp,verbose=FALSE)
+    tmp$kmeans <- kmeans(tmp@reductions$pca@cell.embeddings[,1:npc],centers=cent)$cluster
+    tmp <- FindNeighbors(tmp,dims=1:npc,verbose=FALSE)
+    tmp <- FindClusters(tmp,resolution=reso,verbose=FALSE)
+    tmpgraph <- buildSNNGraph(tmp@reductions$pca@cell.embeddings[,1:npc],transposed=T,k=10,d=NA)
+    res <- cluster_louvain(tmpgraph)$membership
+    cc <- aggregate(tmp@reductions$pca@cell.embeddings[,1:npc],list(res),mean)
+    cc <- as.matrix(cc[,-1])
+    hclu <- hclust(dist(cc))
+    clu <- cutree(hclu,cent)
+    clu <- clu[res]      
+    tmp$lv_clu <- clu
+    #tmp <- tmp@meta.data
+    tmp <- RunUMAP(tmp,dims=1:npc,verbose=FALSE)
+    return(tmp)
+}
+
+evalClustering <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"celltype"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$celltype),function(sct){
+        p <- table(x@meta.data[x$celltype==sct,method])/sum(x$celltype==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$celltype,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$celltype)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+```
+
+# 1500
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+```
+
+## CoDA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  #add pseudocount s/gm to raw count
+  tmp <- as.matrix(raw_dat)
+  gm_s <- exp(mean(log(apply(tmp,2,sum))))
+  tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+  tmp <- t(CLOSE(t(tmp)))
+
+  #CLR
+  raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+  raw_coda_clr <- log2(raw_coda_clr)
+})
+
+end.time <- Sys.time()
+
+time_1500_CLRtrans <- end.time-start.time
+time_1500_CLRtrans
+mem_1500_CLRtrans <- mem$Peak_RAM_Used_MiB
+mem_1500_CLRtrans
+```
+
+
+## normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_lognorm <- NormalizeData(raw_lognorm)})
+end.time <- Sys.time()
+time_1500_LogNormtrans <- end.time-start.time
+time_1500_LogNormtrans
+mem_1500_LogNormtrans <- mem$Peak_RAM_Used_MiB
+mem_1500_LogNormtrans
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)})
+end.time <- Sys.time()
+time_1500_SCTtrans <- end.time-start.time
+time_1500_SCTtrans
+mem_1500_SCTtrans <- mem$Peak_RAM_Used_MiB
+mem_1500_SCTtrans
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+```
+
+writeout/read
+```{r}
+#writeout
+trans_time_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("1500","1500","1500"),Transformation_time=as.numeric(c(time_1500_LogNormtrans,time_1500_SCTtrans,time_1500_CLRtrans)))
+trans_mem_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("1500","1500","1500"),Transformation_mem=c(mem_1500_LogNormtrans,mem_1500_SCTtrans,mem_1500_CLRtrans))
+
+all_res <- list(trans_time_res=trans_time_res,trans_mem_res=trans_mem_res)
+saveRDS(all_res,"results/Scalability/Cell1500.rds")
+```
+
+# 5000
+cell level
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("ForScal_Sim_Mock_G10kC5000_5UGroup_de0.5_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+```
+
+## CoDA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  #add pseudocount s/gm to raw count
+  tmp <- as.matrix(raw_dat)
+  gm_s <- exp(mean(log(apply(tmp,2,sum))))
+  tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+  tmp <- t(CLOSE(t(tmp)))
+
+  #CLR
+  raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+  raw_coda_clr <- log2(raw_coda_clr)
+})
+
+end.time <- Sys.time()
+
+time_5k_CLRtrans <- end.time-start.time
+time_5k_CLRtrans
+mem_5k_CLRtrans <- mem$Peak_RAM_Used_MiB
+mem_5k_CLRtrans
+```
+
+
+## normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_lognorm <- NormalizeData(raw_lognorm)})
+end.time <- Sys.time()
+time_5k_LogNormtrans <- end.time-start.time
+time_5k_LogNormtrans
+mem_5k_LogNormtrans <- mem$Peak_RAM_Used_MiB
+mem_5k_LogNormtrans
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)})
+end.time <- Sys.time()
+time_5k_SCTtrans <- end.time-start.time
+time_5k_SCTtrans
+mem_5k_SCTtrans <- mem$Peak_RAM_Used_MiB
+mem_5k_SCTtrans
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+```
+
+writeout/read
+```{r}
+#writeout
+trans_time_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("5000","5000","5000"),Transformation_time=as.numeric(c(time_5k_LogNormtrans,time_5k_SCTtrans,time_5k_CLRtrans)))
+trans_mem_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("5000","5000","5000"),Transformation_mem=c(mem_5k_LogNormtrans,mem_5k_SCTtrans,mem_5k_CLRtrans))
+
+all_res <- list(trans_time_res=trans_time_res,trans_mem_res=trans_mem_res)
+saveRDS(all_res,"results/Scalability/Cell5k.rds")
+```
+
+# 10000
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("ForScal_Sim_Mock_G10kC10k_5UGroup_de0.5_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+```
+
+## CoDA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  #add pseudocount s/gm to raw count
+  tmp <- as.matrix(raw_dat)
+  gm_s <- exp(mean(log(apply(tmp,2,sum))))
+  tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+  tmp <- t(CLOSE(t(tmp)))
+
+  #CLR
+  raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+  raw_coda_clr <- log2(raw_coda_clr)
+})
+
+end.time <- Sys.time()
+
+time_10k_CLRtrans <- end.time-start.time
+time_10k_CLRtrans
+mem_10k_CLRtrans <- mem$Peak_RAM_Used_MiB
+mem_10k_CLRtrans
+```
+
+## normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_lognorm <- NormalizeData(raw_lognorm)})
+end.time <- Sys.time()
+time_10k_LogNormtrans <- end.time-start.time
+time_10k_LogNormtrans
+mem_10k_LogNormtrans <- mem$Peak_RAM_Used_MiB
+mem_10k_LogNormtrans
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)})
+end.time <- Sys.time()
+time_10k_SCTtrans <- end.time-start.time
+time_10k_SCTtrans
+mem_10k_SCTtrans <- mem$Peak_RAM_Used_MiB
+mem_10k_SCTtrans
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+```
+
+writeout/read
+```{r}
+#writeout
+trans_time_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("10000","10000","10000"),Transformation_time=as.numeric(c(time_10k_LogNormtrans,time_10k_SCTtrans,time_10k_CLRtrans)))
+trans_mem_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("10000","10000","10000"),Transformation_mem=c(mem_10k_LogNormtrans,mem_10k_SCTtrans,mem_10k_CLRtrans))
+
+all_res <- list(trans_time_res=trans_time_res,trans_mem_res=trans_mem_res)
+saveRDS(all_res,"results/Scalability/Cell10k.rds")
+```
+
+# 50000
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("ForScal_Sim_Mock_G10kC50k_5UGroup_de0.5_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+```
+
+## CoDA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  #add pseudocount s/gm to raw count
+  tmp <- as.matrix(raw_dat)
+  gm_s <- exp(mean(log(apply(tmp,2,sum))))
+  tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+  tmp <- t(CLOSE(t(tmp)))
+
+  #CLR
+  raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+  raw_coda_clr <- log2(raw_coda_clr)
+})
+
+end.time <- Sys.time()
+
+time_50k_CLRtrans <- end.time-start.time
+time_50k_CLRtrans
+mem_50k_CLRtrans <- mem$Peak_RAM_Used_MiB
+mem_50k_CLRtrans
+```
+
+## normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_lognorm <- NormalizeData(raw_lognorm)})
+end.time <- Sys.time()
+time_50k_LogNormtrans <- end.time-start.time
+time_50k_LogNormtrans
+mem_50k_LogNormtrans <- mem$Peak_RAM_Used_MiB
+mem_50k_LogNormtrans
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+start.time <- Sys.time()
+mem <- peakRAM({raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)})
+end.time <- Sys.time()
+time_50k_SCTtrans <- end.time-start.time
+time_50k_SCTtrans
+mem_50k_SCTtrans <- mem$Peak_RAM_Used_MiB
+mem_50k_SCTtrans
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+```
+
+writeout/read
+```{r}
+#writeout
+trans_time_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("50000","50000","50000"),Transformation_time=as.numeric(c(time_50k_LogNormtrans,time_50k_SCTtrans,time_50k_CLRtrans)))
+trans_mem_res <- data.frame(Method=c("LogNorm","SCT","CLR"),Cell=c("50000","50000","50000"),Transformation_mem=c(mem_50k_LogNormtrans,mem_50k_SCTtrans,mem_50k_CLRtrans))
+
+all_res <- list(trans_time_res=trans_time_res,PCA_time_res=PCA_time_res,trans_mem_res=trans_mem_res,PCA_mem_res=PCA_mem_res)
+saveRDS(all_res,"results/Scalability/Cell50k.rds")
+```
+
+# summary
+```{r}
+d1 <- readRDS("results/Scalability/Cell1500.rds")
+d2 <- readRDS("results/Scalability/Cell5k.rds")
+d3 <- readRDS("results/Scalability/Cell10k.rds")
+d4 <- readRDS("results/Scalability/Cell50k.rds")
+```
+
+## Transformation time
+```{r}
+trans_time <- rbind(d1$trans_time_res,d2$trans_time_res,d3$trans_time_res,d4$trans_time_res)
+
+trans_time$Cell <- factor(trans_time$Cell,levels=c("1500","5000","10000","50000"))
+```
+
+plots
+```{r}
+p1_trans_time <- ggplot(trans_time,aes(x=Cell,y=Transformation_time,group=Method,color=Method))+geom_line()+geom_point()+theme_minimal()+xlab("Number of Cells")+ylab("Transformation time(s) used")+ggtitle("Transformation time(s) used")+scale_color_manual(values=selected_palette)+theme(plot.title=element_text(size=18),legend.title=element_text(size=17),legend.text=element_text(size=16),axis.title=element_text(size=17),axis.text=element_text(size=16))
+p1_trans_time
+```
+
+## Transformation mem
+```{r}
+trans_mem <- rbind(d1$trans_mem_res,d2$trans_mem_res,d3$trans_mem_res,d4$trans_mem_res)
+
+trans_mem$Cell <- factor(trans_mem$Cell,levels=c("1500","5000","10000","50000"))
+```
+
+plots
+```{r}
+p3_trans_mem <- ggplot(trans_mem,aes(x=Cell,y=Transformation_mem,group=Method,color=Method))+geom_line()+geom_point()+theme_minimal()+xlab("Number of Cells")+ylab("Transformation max memory usage (MB)")+ggtitle("Transformation max memory usage (MB)")+scale_color_manual(values=selected_palette)+theme(plot.title=element_text(size=18),legend.title=element_text(size=17),legend.text=element_text(size=16),axis.title=element_text(size=17),axis.text=element_text(size=16))
+p3_trans_mem
+```
+
+## combine plot
+```{r fig.height=2.5, fig.width=7}
+trans_time_mem <- ggarrange(p1_trans_time,p3_trans_mem,ncol=2,nrow=1,labels="AUTO")
+trans_time_mem
+```
+
+# LRA vs CLR+Seurat PCA
+## 1500
+### CLR+Seurat PCA processes(CLR+Scale+RunPCA)
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+metadat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.rds")
+truedat <- metadat@assays@data$TrueCounts
+
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- metadat$Cell
+metadat$celltype <- metadat$Group
+
+dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+dat <- FindVariableFeatures(dat,nfeatures=3000,verbose=FALSE)
+selected_features <- dat@assays$RNA@var.features
+```
+
+CLRPCA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+    CLRPCA <- as.matrix(raw_dat[selected_features,])
+    gm_s <- exp(mean(log(apply(CLRPCA,2,sum))))
+    CLRPCA <- apply(CLRPCA,2,function(x) x+(sum(x)/gm_s) )
+    CLRPCA <- t(CLOSE(t(CLRPCA)))
+    CLRPCA <- apply(CLRPCA,2,function(x) x/exp(mean(log(x))) )
+    CLRPCA <- log(CLRPCA)
+    CLRPCA <- CreateSeuratObject(CLRPCA,min.cells=0,min.features=0)
+    CLRPCA <- ScaleData(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+    CLRPCA <- RunPCA(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_1500_CLRPCA <- end.time-start.time
+time_1500_CLRPCA
+mem_1500_CLRPCA <- mem$Peak_RAM_Used_MiB
+mem_1500_CLRPCA
+```
+
+LRA
+```{r}
+#LRA
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  tmp_forLRA <- as.matrix(raw_dat[selected_features,])
+  gm_s <- exp(mean(log(apply(tmp_forLRA,2,sum))))
+  tmp_forLRA <- apply(tmp_forLRA,2,function(x) x+(sum(x)/gm_s) )
+  tmp_forLRA <- CLOSE(t(tmp_forLRA))
+  tmp3.uwLRA <- LRA(tmp_forLRA,weight=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_1500_LRA <- end.time-start.time
+time_1500_LRA
+mem_1500_LRA <- mem$Peak_RAM_Used_MiB
+mem_1500_LRA
+```
+
+writeout/read
+```{r}
+#writeout
+PCA_time_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("1500","1500"),PCA_time=as.numeric(c(time_1500_CLRPCA,time_1500_LRA)))
+PCA_mem_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("1500","1500"),PCA_mem=c(mem_1500_CLRPCA,mem_1500_LRA))
+
+all_res <- list(PCA_time_res=PCA_time_res,PCA_mem_res=PCA_mem_res)
+saveRDS(all_res,"results/Scalability/Cell1500_CLRPCA_LRA.rds")
+```
+
+## 5000
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("ForScal_Sim_Mock_G10kC5000_5UGroup_de0.5_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+dat <- FindVariableFeatures(dat,nfeatures=3000,verbose=FALSE)
+selected_features <- dat@assays$RNA@var.features
+```
+
+CLRPCA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+    CLRPCA <- as.matrix(raw_dat[selected_features,])
+    gm_s <- exp(mean(log(apply(CLRPCA,2,sum))))
+    CLRPCA <- apply(CLRPCA,2,function(x) x+(sum(x)/gm_s) )
+    CLRPCA <- t(CLOSE(t(CLRPCA)))
+    CLRPCA <- apply(CLRPCA,2,function(x) x/exp(mean(log(x))) )
+    CLRPCA <- log(CLRPCA)
+    CLRPCA <- CreateSeuratObject(CLRPCA,min.cells=0,min.features=0)
+    CLRPCA <- ScaleData(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+    CLRPCA <- RunPCA(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_5000_CLRPCA <- end.time-start.time
+time_5000_CLRPCA
+mem_5000_CLRPCA <- mem$Peak_RAM_Used_MiB
+mem_5000_CLRPCA
+```
+
+LRA
+```{r}
+#LRA
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  tmp_forLRA <- as.matrix(raw_dat[selected_features,])
+  gm_s <- exp(mean(log(apply(tmp_forLRA,2,sum))))
+  tmp_forLRA <- apply(tmp_forLRA,2,function(x) x+(sum(x)/gm_s) )
+  tmp_forLRA <- CLOSE(t(tmp_forLRA))
+  tmp3.uwLRA <- LRA(tmp_forLRA,weight=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_5000_LRA <- end.time-start.time
+time_5000_LRA
+mem_5000_LRA <- mem$Peak_RAM_Used_MiB
+mem_5000_LRA
+```
+
+writeout/read
+```{r}
+#writeout
+PCA_time_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("5000","5000"),PCA_time=as.numeric(c(time_5000_CLRPCA,time_5000_LRA)))
+PCA_mem_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("5000","5000"),PCA_mem=c(mem_5000_CLRPCA,mem_5000_LRA))
+
+all_res <- list(PCA_time_res=PCA_time_res,PCA_mem_res=PCA_mem_res)
+saveRDS(all_res,"results/Scalability/Cell5000_CLRPCA_LRA.rds")
+```
+
+## 10000
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("ForScal_Sim_Mock_G10kC10k_5UGroup_de0.5_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+dat <- FindVariableFeatures(dat,nfeatures=3000,verbose=FALSE)
+selected_features <- dat@assays$RNA@var.features
+```
+
+CLRPCA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+    CLRPCA <- as.matrix(raw_dat[selected_features,])
+    gm_s <- exp(mean(log(apply(CLRPCA,2,sum))))
+    CLRPCA <- apply(CLRPCA,2,function(x) x+(sum(x)/gm_s) )
+    CLRPCA <- t(CLOSE(t(CLRPCA)))
+    CLRPCA <- apply(CLRPCA,2,function(x) x/exp(mean(log(x))) )
+    CLRPCA <- log(CLRPCA)
+    CLRPCA <- CreateSeuratObject(CLRPCA,min.cells=0,min.features=0)
+    CLRPCA <- ScaleData(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+    CLRPCA <- RunPCA(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_10k_CLRPCA <- end.time-start.time
+time_10k_CLRPCA
+mem_10k_CLRPCA <- mem$Peak_RAM_Used_MiB
+mem_10k_CLRPCA
+```
+
+
+LRA
+```{r}
+#LRA
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  tmp_forLRA <- as.matrix(raw_dat[selected_features,])
+  gm_s <- exp(mean(log(apply(tmp_forLRA,2,sum))))
+  tmp_forLRA <- apply(tmp_forLRA,2,function(x) x+(sum(x)/gm_s) )
+  tmp_forLRA <- CLOSE(t(tmp_forLRA))
+  tmp3.uwLRA <- LRA(tmp_forLRA,weight=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_10k_LRA <- end.time-start.time
+time_10k_LRA
+mem_10k_LRA <- mem$Peak_RAM_Used_MiB
+mem_10k_LRA
+```
+
+writeout/read
+```{r}
+#writeout
+PCA_time_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("10000","10000"),PCA_time=as.numeric(c(time_10k_CLRPCA,time_10k_LRA)))
+PCA_mem_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("10000","10000"),PCA_mem=c(mem_10k_CLRPCA,mem_10k_LRA))
+
+all_res <- list(PCA_time_res=PCA_time_res,PCA_mem_res=PCA_mem_res)
+saveRDS(all_res,"results/Scalability/Cell10k_CLRPCA_LRA.rds")
+```
+
+## 50000
+read data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("ForScal_Sim_Mock_G10kC50k_5UGroup_de0.5_dropout90.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+
+dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+dat <- FindVariableFeatures(dat,nfeatures=3000,verbose=FALSE)
+selected_features <- dat@assays$RNA@var.features
+```
+
+CLRPCA
+```{r}
+start.time <- Sys.time()
+
+mem <- peakRAM({
+    CLRPCA <- as.matrix(raw_dat[selected_features,])
+    gm_s <- exp(mean(log(apply(CLRPCA,2,sum))))
+    CLRPCA <- apply(CLRPCA,2,function(x) x+(sum(x)/gm_s) )
+    CLRPCA <- t(CLOSE(t(CLRPCA)))
+    CLRPCA <- apply(CLRPCA,2,function(x) x/exp(mean(log(x))) )
+    CLRPCA <- log(CLRPCA)
+    CLRPCA <- CreateSeuratObject(CLRPCA,min.cells=0,min.features=0)
+    CLRPCA <- ScaleData(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+    CLRPCA <- RunPCA(CLRPCA,features=rownames(CLRPCA),verbose=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_50k_CLRPCA <- end.time-start.time
+time_50k_CLRPCA
+mem_50k_CLRPCA <- mem$Peak_RAM_Used_MiB
+mem_50k_CLRPCA
+```
+
+
+LRA
+```{r}
+#LRA
+start.time <- Sys.time()
+
+mem <- peakRAM({
+  tmp_forLRA <- as.matrix(raw_dat[selected_features,])
+  gm_s <- exp(mean(log(apply(tmp_forLRA,2,sum))))
+  tmp_forLRA <- apply(tmp_forLRA,2,function(x) x+(sum(x)/gm_s) )
+  tmp_forLRA <- CLOSE(t(tmp_forLRA))
+  tmp3.uwLRA <- LRA(tmp_forLRA,weight=FALSE)
+})
+
+end.time <- Sys.time()
+
+time_50k_LRA <- end.time-start.time
+time_50k_LRA
+mem_50k_LRA <- mem$Peak_RAM_Used_MiB
+mem_50k_LRA
+```
+
+writeout/read
+```{r}
+#writeout
+PCA_time_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("50000","50000"),PCA_time=as.numeric(c(time_50k_CLRPCA,time_50k_LRA)))
+PCA_mem_res <- data.frame(Method=c("CLR+Seurat PCA","LRA"),Cell=c("50000","50000"),PCA_mem=c(mem_50k_CLRPCA,mem_50k_LRA))
+
+all_res <- list(PCA_time_res=PCA_time_res,PCA_mem_res=PCA_mem_res)
+saveRDS(all_res,"results/Scalability/Cell50k_CLRPCA_LRA.rds")
+```
+
+## summary
+```{r}
+d1 <- readRDS("results/Scalability/Cell1500_CLRPCA_LRA.rds")
+d2 <- readRDS("results/Scalability/Cell5000_CLRPCA_LRA.rds")
+d3 <- readRDS("results/Scalability/Cell10k_CLRPCA_LRA.rds")
+d4 <- readRDS("results/Scalability/Cell50k_CLRPCA_LRA.rds")
+
+d3$PCA_time_res$PCA_time <- d3$PCA_time_res$PCA_time*60
+```
+
+### PCA time
+```{r}
+pca_time <- rbind(d1$PCA_time_res,d2$PCA_time_res,d3$PCA_time_res,d4$PCA_time_res)
+
+pca_time$Cell <- factor(pca_time$Cell,levels=c("1500","5000","10000","50000"))
+#df_time$Time_log <- log2(df_time$Time)
+pca_time$Time_min <- pca_time$PCA_time/60
+
+pca_time[pca_time$Method=="CLR+Seurat PCA",]$Method <- "CLR+partial-SVD"
+```
+
+plots
+```{r}
+p2_pca_time <- ggplot(pca_time,aes(x=Cell,y=Time_min,group=Method,color=Method))+geom_line()+geom_point()+theme_minimal()+xlab("Number of Cells")+ylab("Time(min) used")+ggtitle("Time(min) used (Top 3000 features used)")+scale_color_manual(values=selected_palette)+theme(plot.title=element_text(size=18),legend.title=element_text(size=17),legend.text=element_text(size=16),axis.title=element_text(size=17),axis.text=element_text(size=16))
+p2_pca_time
+```
+
+### PCA mem
+```{r}
+pca_mem <- rbind(d1$PCA_mem_res,d2$PCA_mem_res,d3$PCA_mem_res,d4$PCA_mem_res)
+
+pca_mem$Cell <- factor(pca_mem$Cell,levels=c("1500","5000","10000","50000"))
+
+pca_mem[pca_mem$Method=="CLR+Seurat PCA",]$Method <- "CLR+partial-SVD"
+```
+
+plots
+```{r}
+p4_pca_mem <- ggplot(pca_mem,aes(x=Cell,y=PCA_mem,group=Method,color=Method))+geom_line()+geom_point()+theme_minimal()+xlab("Number of Cells")+ylab("Max memory usage (MB)")+ggtitle("Max memory usage (MB) (Top 3000 features used)")+scale_color_manual(values=selected_palette)+theme(plot.title=element_text(size=18),legend.title=element_text(size=17),legend.text=element_text(size=16),axis.title=element_text(size=17),axis.text=element_text(size=16))
+p4_pca_mem
+```
+
+## combine plot
+```{r fig.height=2.5, fig.width=7.5}
+pca_time_mem <- ggarrange(p2_pca_time,p4_pca_mem,ncol=2,nrow=1,labels=c("C","D"))
+pca_time_mem
+```
+
+```{r fig.height=5, fig.width=7.5}
+ggarrange(trans_time_mem,pca_time_mem,ncol=1,nrow=2)
+```
+

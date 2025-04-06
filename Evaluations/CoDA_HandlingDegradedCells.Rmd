@@ -1,0 +1,646 @@
+---
+title: "CoDA_HandlingDegradedCells"
+output: html_document
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(robCompositions)
+library(easyCODA)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(scmap)
+library(monocle3)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(combinat)
+library(Hmisc)
+library(plotly)
+library(ISnorm)
+library(dbscan)
+library(ca)
+library(factoextra)
+```
+
+functions
+```{r message=FALSE, warning=FALSE}
+get_earliest_principal_node <- function(cds, time_bin="C8"){
+  cell_ids <- which(colData(cds)[,"cluster"] == time_bin)
+  
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+
+getCluster <- function(x,meta,reso=0.01,npc=10,cent=4,scale_data=FALSE){
+    tmp <- CreateSeuratObject(counts=x,meta.data=meta,min.cells=0,min.features=0)
+    tmp <- FindVariableFeatures(tmp,nfeatures=3000,verbose=FALSE)
+    if(scale_data){
+        tmp <- ScaleData(tmp,verbose=FALSE)
+    }else{
+        tmp[["RNA"]]@scale.data <- as.matrix(tmp[["RNA"]]@counts[VariableFeatures(tmp),])
+    }
+    tmp <- RunPCA(tmp,verbose=FALSE)
+    tmp$kmeans <- kmeans(tmp@reductions$pca@cell.embeddings[,1:npc],centers=cent)$cluster
+    tmp <- FindNeighbors(tmp,dims=1:npc,verbose=FALSE)
+    tmp <- FindClusters(tmp,resolution=reso,verbose=FALSE)
+    tmpgraph <- buildSNNGraph(tmp@reductions$pca@cell.embeddings[,1:npc],transposed=T,k=10,d=NA)
+    res <- cluster_louvain(tmpgraph)$membership
+    cc <- aggregate(tmp@reductions$pca@cell.embeddings[,1:npc],list(res),mean)
+    cc <- as.matrix(cc[,-1])
+    hclu <- hclust(dist(cc))
+    clu <- cutree(hclu,cent)
+    clu <- clu[res]      
+    tmp$lv_clu <- clu
+    #tmp <- tmp@meta.data
+    tmp <- RunUMAP(tmp,dims=1:npc,verbose=FALSE)
+    return(tmp)
+}
+
+evalClustering <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"celltype"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$celltype),function(sct){
+        p <- table(x@meta.data[x$celltype==sct,method])/sum(x$celltype==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$celltype,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$celltype)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+
+evalClustering_twoGroup <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"label"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$label),function(sct){
+        p <- table(x@meta.data[x$label==sct,method])/sum(x$label==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$label,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$label)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+```
+
+# Handle degraded cells
+## cellbench 
+read and process
+```{r}
+bulk_dat <- readRDS("GSE86337_processed_count_average_replicates.rds")
+
+##raw
+dat <- fread("cellbench_sc_10x_5cl_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dat <- as.matrix(dat,rownames=1)
+
+metadat <- sapply(colnames(dat),function(x) strsplit(x,"\\.")[[1]][2])
+metadat <- data.frame(cell=colnames(dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat),]
+dat <- dat[rownames(bulk_dat),]
+
+#raw lognorm
+dat <- CreateSeuratObject(dat,meta.data=metadat,min.cells=0,min.features=0)
+dat <- NormalizeData(dat)
+dat <- FindVariableFeatures(dat,nfeatures=3000)
+dat <- ScaleData(dat)
+dat <- RunPCA(dat)
+dat <- RunUMAP(dat,dims=1:50)
+```
+
+### randomly assign top gene zeros for each cell
+10% H1975 cells and 6000 genes (~60%)
+```{r}
+#rank expressed features in selected types
+SelectedType <- rownames(dat@meta.data[dat@meta.data$celltype=="H1975",])
+SelectedTypeMat <- as.matrix(dat@assays$RNA@counts)
+SelectedTypeMat <- SelectedTypeMat[,SelectedType]
+TopFeatures <- apply(SelectedTypeMat,1,sum)
+names(TopFeatures) <- rownames(SelectedTypeMat)
+TopFeatures <- names(TopFeatures[order(TopFeatures,decreasing=TRUE)])
+
+#select 10% of cells and copy
+set.seed(3)
+Selected10Cells <- sample(x=SelectedType,size=0.1*length(SelectedType))
+SelectedCellMat <- SelectedTypeMat[,Selected10Cells]
+
+#assign zeros
+RandomAssignZeros <- function(x,g,gname){
+    names(x) <- gname
+    SelectedGenes <- sample(g,size=6000)
+    x[SelectedGenes] <- 0
+    return(x)
+}
+
+ProcessedCellMat <- apply(SelectedCellMat,2,RandomAssignZeros,TopFeatures,rownames(SelectedCellMat))
+colnames(ProcessedCellMat) <- paste0(colnames(ProcessedCellMat),".copy")
+
+#combine
+tmp <- cbind(as.matrix(dat@assays$RNA@counts),ProcessedCellMat)
+tmpmeta <- data.frame(cell=colnames(ProcessedCellMat),celltype=rep("H1975.zero",ncol(ProcessedCellMat)))
+rownames(tmpmeta) <- tmpmeta$cell
+tmpmeta <- rbind(dat@meta.data[,c("cell","celltype")],tmpmeta)
+
+#plot
+tmp <- CreateSeuratObject(tmp,meta.data=tmpmeta,min.cells=0,min.features=0)
+
+tmp <- NormalizeData(tmp)
+tmp <- FindVariableFeatures(tmp,nfeatures=3000)
+tmp <- ScaleData(tmp)
+tmp <- RunPCA(tmp)
+tmp <- RunUMAP(tmp,dims=1:50)
+
+#sct
+tmp_sct <- CreateSeuratObject(counts=tmp@assays$RNA@counts,meta.data=tmpmeta,min.cells=0,min.features=0)
+tmp_sct <- SCTransform(tmp_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+tmp_sct <- RunPCA(tmp_sct)
+tmp_sct <- RunUMAP(tmp_sct,dims=1:50)
+```
+
+CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp1 <- as.matrix(tmp@assays$RNA@counts)
+gm_s <- exp(mean(log(apply(tmp1,2,sum))))
+tmp1 <- apply(tmp1,2,function(x) x+(sum(x)/gm_s) )
+tmp1 <- t(CLOSE(t(tmp1)))
+
+#CLR
+raw_coda_clr <- apply(tmp1,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(tmp1)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp1,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp1))))
+cb_ILR <- cb_ILR[,colnames(raw_coda_clr)]
+
+#Seurat process
+processSeurat <- function(x,metadat){
+    res <- CreateSeuratObject(x,meta.data=metadat,min.cells=0,min.features=0)
+    res <- FindVariableFeatures(res,nfeatures=3000)
+    res <- ScaleData(res)
+    res <- RunPCA(res)
+    res <- RunUMAP(res,dims=1:50)
+    return(res)
+}
+
+raw_coda_clr <- processSeurat(raw_coda_clr,tmp@meta.data)
+raw_coda_ilr <- processSeurat(raw_coda_ilr,tmp@meta.data)
+cb_ILR <- processSeurat(cb_ILR,tmp@meta.data)
+
+alldat <- list(Raw_LogNorm=tmp,Raw_SCT=tmp_sct,SGM_CLR=raw_coda_clr,SGM_ILR=cb_ILR,SGM_HKGLR=raw_coda_ilr)
+alldat <- alldat[c("Raw_LogNorm","Raw_SCT","SGM_CLR","SGM_ILR","SGM_HKGLR")]
+alldat_CellBench <- alldat
+```
+
+plots
+umap
+```{r fig.height=7.5, fig.width=8.5}
+p_list <- list()
+for(x in names(alldat)){
+    p_list[[x]] <- DimPlot(alldat[[x]],group.by="celltype",label=TRUE,repel=TRUE)+ggtitle(x)+NoLegend()+scale_color_manual(values=selected_palette)
+}
+
+ggarrange(plotlist=p_list,nrow=3,ncol=3)
+```
+
+pca
+```{r fig.height=7.5, fig.width=8.5}
+p_list <- list()
+for(x in names(alldat)){
+    p_list[[x]] <- DimPlot(alldat[[x]],group.by="celltype",label=TRUE,repel=TRUE,reduction="pca")+ggtitle(x)+NoLegend()+scale_color_manual(values=selected_palette)
+}
+
+ggarrange(plotlist=p_list,nrow=3,ncol=3)
+```
+
+#### zoom in
+```{r fig.height=2.5, fig.width=16.5, message=FALSE, warning=FALSE}
+processSubset <- function(x){
+    tmp_sub <- subset(x,celltype%in%c("H1975","H1975.zero"))
+    tmp_sub <- RunPCA(tmp_sub)
+    tmp_sub <- RunUMAP(tmp_sub,dims=1:50)
+    return(tmp_sub)
+}
+alldat_sub <- lapply(alldat,processSubset)
+
+umap_list <- list()
+for(x in names(alldat_sub)){
+    umap_list[[x]] <- DimPlot(alldat_sub[[x]],group.by="celltype",repel=TRUE)+ggtitle(x)+scale_color_manual(values=selected_palette)
+}
+cb10x5cl_umap <- ggarrange(plotlist=umap_list,nrow=1,ncol=5)
+cb10x5cl_umap
+
+pca_list <- list()
+for(x in names(alldat_sub)){
+    # get variance explained
+    tmppca <- alldat_sub[[x]][["pca"]]
+    total_variance <- tmppca@misc$total.variance
+    # Get the total/top50 variance
+    eigValues <- (tmppca@stdev)^2  ## EigenValues
+    varExplained <- round(eigValues/total_variance*100,2)[1:2] #total
+    #varExplained <- round(eigValues/sum(eigValues)*100,2)[1:2] #top50
+    rm(tmppca)
+    
+    pca_list[[x]] <- DimPlot(alldat_sub[[x]],group.by="celltype",repel=TRUE,reduction="pca")+ggtitle(x)+scale_color_manual(values=selected_palette)+xlab(paste0("PC1(",varExplained[1],"%)"))+ylab(paste0("PC2(",varExplained[2],"%)"))
+}
+
+cb10x5cl_pca <- ggarrange(plotlist=pca_list,nrow=1,ncol=5)
+cb10x5cl_pca
+```
+
+## GSE75748
+```{r}
+##bulk
+bulk_dat <- read.csv("GSE75748_bulk_cell_type_ec.csv",header=TRUE,row.names=1)
+bulk_dat <- DGEList(bulk_dat)
+keep <- filterByExpr(bulk_dat)
+bulk_dat <- bulk_dat[keep,,keep.lib.sizes=FALSE]
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta <- c("H1","H1","H1","H1","H9","H9","H9","DEC","DEC","EC","EC","EC","HFF","HFF","HFF","NPC","NPC","TB","TB")
+mm <- model.matrix(~0 + bulk_meta)
+bulk_dat <- voom(bulk_dat,mm,plot=FALSE)$E
+bulk_dat <- data.frame(H1=apply(bulk_dat[,1:4],1,mean),H9=apply(bulk_dat[,5:7],1,mean),DEC=apply(bulk_dat[,8:9],1,mean),EC=apply(bulk_dat[,10:12],1,mean),HFF=apply(bulk_dat[,13:15],1,mean),NPC=apply(bulk_dat[,16:17],1,mean),TB=apply(bulk_dat[,18:19],1,mean))
+
+##raw
+dat <- fread("GSE75748_sc_cell_type_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dat <- as.matrix(dat,rownames=1)
+
+metadat <- sapply(colnames(dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(dat),celltype=metadat)
+
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat),]
+dat <- dat[rownames(bulk_dat),]
+
+#raw lognorm
+dat <- CreateSeuratObject(dat,meta.data=metadat,min.cells=0,min.features=0)
+dat <- NormalizeData(dat)
+dat <- FindVariableFeatures(dat,nfeatures=3000)
+dat <- ScaleData(dat)
+dat <- RunPCA(dat)
+dat <- RunUMAP(dat,dims=1:10)
+```
+
+### randomly assign top gene zeros for each cell
+50% H1 and 7400 gene(~60%)
+```{r}
+#rank expressed features in selected types
+SelectedType <- rownames(dat@meta.data[dat@meta.data$celltype=="H1",])
+SelectedTypeMat <- as.matrix(dat@assays$RNA@counts)
+SelectedTypeMat <- SelectedTypeMat[,SelectedType]
+TopFeatures <- apply(SelectedTypeMat,1,sum)
+names(TopFeatures) <- rownames(SelectedTypeMat)
+TopFeatures <- names(TopFeatures[order(TopFeatures,decreasing=TRUE)])
+
+#select 10% of cells and copy
+set.seed(1)
+Selected10Cells <- sample(x=SelectedType,size=0.5*length(SelectedType))
+SelectedCellMat <- SelectedTypeMat[,Selected10Cells]
+
+#assign zeros
+RandomAssignZeros <- function(x,g,gname){
+    names(x) <- gname
+    SelectedGenes <- sample(g,size=7400)
+    x[SelectedGenes] <- 0
+    return(x)
+}
+
+ProcessedCellMat <- apply(SelectedCellMat,2,RandomAssignZeros,TopFeatures,rownames(SelectedCellMat))
+colnames(ProcessedCellMat) <- paste0(colnames(ProcessedCellMat),".copy")
+
+#combine
+tmp <- cbind(as.matrix(dat@assays$RNA@counts),ProcessedCellMat)
+tmpmeta <- data.frame(cell=colnames(ProcessedCellMat),celltype=rep("H1.zero",ncol(ProcessedCellMat)))
+rownames(tmpmeta) <- tmpmeta$cell
+tmpmeta <- rbind(dat@meta.data[,c("cell","celltype")],tmpmeta)
+
+#plot
+tmp <- CreateSeuratObject(tmp,meta.data=tmpmeta,min.cells=0,min.features=0)
+
+tmp <- NormalizeData(tmp)
+tmp <- FindVariableFeatures(tmp,nfeatures=3000)
+tmp <- ScaleData(tmp)
+tmp <- RunPCA(tmp)
+tmp <- RunUMAP(tmp,dims=1:10)
+
+#sct
+tmp_sct <- CreateSeuratObject(counts=tmp@assays$RNA@counts,meta.data=tmpmeta,min.cells=0,min.features=0)
+tmp_sct <- SCTransform(tmp_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+tmp_sct <- RunPCA(tmp_sct)
+tmp_sct <- RunUMAP(tmp_sct,dims=1:10)
+```
+
+CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp1 <- as.matrix(tmp@assays$RNA@counts)
+gm_s <- exp(mean(log(apply(tmp1,2,sum))))
+tmp1 <- apply(tmp1,2,function(x) x+(sum(x)/gm_s) )
+tmp1 <- t(CLOSE(t(tmp1)))
+
+#CLR
+raw_coda_clr <- apply(tmp1,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(tmp1)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp1,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+##ILR
+cb_ILR <- as.matrix(t(coda.base::coordinates(t(tmp1))))
+cb_ILR <- cb_ILR[,colnames(raw_coda_clr)]
+
+#Seurat process
+processSeurat <- function(x,metadat){
+    res <- CreateSeuratObject(x,meta.data=metadat,min.cells=0,min.features=0)
+    res <- FindVariableFeatures(res,nfeatures=3000)
+    res <- ScaleData(res)
+    res <- RunPCA(res)
+    res <- RunUMAP(res,dims=1:50)
+    return(res)
+}
+
+raw_coda_clr <- processSeurat(raw_coda_clr,tmp@meta.data)
+raw_coda_ilr <- processSeurat(raw_coda_ilr,tmp@meta.data)
+cb_ILR <- processSeurat(cb_ILR,tmp@meta.data)
+
+alldat <- list(Raw_LogNorm=tmp,Raw_SCT=tmp_sct,SGM_CLR=raw_coda_clr,SGM_ILR=cb_ILR,SGM_HKGLR=raw_coda_ilr)
+alldat <- alldat[c("Raw_LogNorm","Raw_SCT","SGM_CLR","SGM_ILR","SGM_HKGLR")]
+alldat_GSE75748 <- alldat
+```
+
+plots umap
+```{r fig.height=7.5, fig.width=8.5}
+p_list <- list()
+for(x in names(alldat)){
+    p_list[[x]] <- DimPlot(alldat[[x]],group.by="celltype",label=TRUE,repel=TRUE)+ggtitle(x)+NoLegend()+scale_color_manual(values=selected_palette)
+}
+
+p_list <- p_list[c("LogNorm","SCT","mdCLR","CLR","IQLR","LVHA","HKGLR","IQLR_group","LVHA_group")]
+ggarrange(plotlist=p_list,nrow=3,ncol=3)
+```
+
+#### zoom in
+```{r fig.height=2.5, fig.width=16.5, message=FALSE, warning=FALSE}
+processSubset <- function(x){
+    tmp_sub <- subset(x,celltype%in%c("H1","H1.zero","H9"))
+    tmp_sub <- RunPCA(tmp_sub)
+    tmp_sub <- RunUMAP(tmp_sub,dims=1:10)
+    return(tmp_sub)
+}
+alldat_sub <- lapply(alldat,processSubset)
+
+umap_list <- list()
+for(x in names(alldat_sub)){
+    umap_list[[x]] <- DimPlot(alldat_sub[[x]],group.by="celltype",repel=TRUE)+ggtitle(x)+scale_color_manual(values=selected_palette)
+}
+gse75748_umap <- ggarrange(plotlist=umap_list,nrow=1,ncol=5)
+gse75748_umap
+
+pca_list <- list()
+for(x in names(alldat_sub)){
+    # get variance explained
+    tmppca <- alldat_sub[[x]][["pca"]]
+    total_variance <- tmppca@misc$total.variance
+    # Get the total/top50 variance
+    eigValues <- (tmppca@stdev)^2  ## EigenValues
+    varExplained <- round(eigValues/total_variance*100,2)[1:2] #total
+    #varExplained <- round(eigValues/sum(eigValues)*100,2)[1:2] #top50
+    rm(tmppca)
+    
+    pca_list[[x]] <- DimPlot(alldat_sub[[x]],group.by="celltype",repel=TRUE,reduction="pca")+ggtitle(x)+scale_color_manual(values=selected_palette)+xlab(paste0("PC1(",varExplained[1],"%)"))+ylab(paste0("PC2(",varExplained[2],"%)"))
+}
+#ggarrange(plotlist=pca_list,nrow=3,ncol=3)
+gse75748_pca <- ggarrange(plotlist=pca_list,nrow=1,ncol=5)
+gse75748_pca
+```
+
+## combine figure
+```{r fig.height=5, fig.width=16.5}
+ggarrange(cb10x5cl_umap,gse75748_umap,ncol=1,nrow=2)
+ggarrange(cb10x5cl_pca,gse75748_pca,ncol=1,nrow=2)
+```
+
+## clustering performance of subset degraded-cell datasets
+### GSE75748
+```{r}
+alldat_GSE75748_sub <- lapply(alldat_GSE75748,function(x) subset(x,celltype%in%c("H1","H1.zero","H9")) )
+metadat <- alldat_GSE75748_sub$Raw_LogNorm@meta.data
+alldat_GSE75748_sub1 <- lapply(alldat_GSE75748_sub,function(x) as.matrix(x@assays$RNA@counts) )
+alldat_GSE75748_sub1$Raw_LogNorm <- as.matrix(alldat_GSE75748_sub$Raw_LogNorm@assays$RNA@data)
+alldat_GSE75748_sub1$Raw_SCT <- as.matrix(alldat_GSE75748_sub$Raw_SCT@assays$SCT@data)
+
+datCluster <- lapply(alldat_GSE75748_sub1,getCluster,metadat,cent=3,scale_data=TRUE)
+
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+### CellBench
+```{r}
+alldat_CellBench_sub <- lapply(alldat_CellBench,function(x) subset(x,celltype%in%c("H1975","H1975.zero")) )
+metadat <- alldat_CellBench_sub$Raw_LogNorm@meta.data
+alldat_CellBench_sub1 <- lapply(alldat_CellBench_sub,function(x) as.matrix(x@assays$RNA@counts) )
+alldat_CellBench_sub1$Raw_LogNorm <- as.matrix(alldat_CellBench_sub$Raw_LogNorm@assays$RNA@data)
+alldat_CellBench_sub1$Raw_SCT <- as.matrix(alldat_CellBench_sub$Raw_SCT@assays$SCT@data)
+
+datCluster <- lapply(alldat_CellBench_sub1,getCluster,metadat,cent=2,scale_data=TRUE)
+
+res2_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res2_lv))
+
+res2_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res2_km))
+```
+
+### summary and visualization
+#### process data(lv)
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","cellbench"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","cellbench"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res1_lv)[-1]
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_melt$method <- factor(res_lv_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_melt[,]
+zero_s_lv_hm_ind <- ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(2.5,4.5,6.5),linetype="dashed")+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)")+geom_text(aes(label=round(Metrics_Difference,2)))+xlab("Method")
+zero_s_lv_hm_ind
+```
+
+#### process data(km)
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","cellbench"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","cellbench"))
+    tmp_median <- apply(tmp,2,median,na.rm=TRUE)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res1_km)[-1]
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+heatmap(all datasets&metrics)
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_melt$method <- factor(res_km_melt$method,levels=rank1)
+
+tmp_hm <- res_km_melt[,]
+#tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference<(-0.25),-0.25,tmp_hm$Metrics_Difference)
+#tmp_hm$Metrics_Difference <- ifelse(tmp_hm$Metrics_Difference>0.1,0.1,tmp_hm$Metrics_Difference)
+#tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+zero_s_km_hm_ind <- ggplot(tmp_hm,aes(method,Metrics_Datasets,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_hline(yintercept=c(2.5,4.5,6.5),linetype="dashed")+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)")+geom_text(aes(label=round(Metrics_Difference,2)))+xlab("Method")
+zero_s_km_hm_ind
+```
+
+### combine
+```{r fig.height=1.8, fig.width=6.6}
+ggarrange(zero_s_lv_hm_ind,zero_s_km_hm_ind,nrow=1,ncol=2)
+```
+

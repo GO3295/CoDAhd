@@ -1,0 +1,1020 @@
+---
+title: "CoDA_BiomPred"
+output: html_document
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(robCompositions)
+library(easyCODA)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(scmap)
+library(monocle3)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+#library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(combinat)
+library(Hmisc)
+```
+
+functions
+```{r}
+getAUC <- function(x,outcome){
+    tmp <- auc(outcome,x)
+    tmp <- attr(tmp,"roc")$auc
+    return(tmp)
+}
+
+getPsig <- function(x){
+    if(x>0.1){
+        return(" ")
+    }else if(x<=0.0005){
+        return("***")
+    }else if(x<=0.005){
+        return("**")
+    }else if(x<=0.05){
+        return("*")
+    }else if(x<=0.1){
+        return(".")
+    }
+}
+
+performDE_bulk <- function(ds,cond,status1,status2){
+    #bulk
+    mm <- model.matrix(~0 + cond)
+    y <- voom(ds,mm,plot=F)
+    fit <- lmFit(y, mm)
+    #print(head(coef(fit)))
+    exp_tmp <- sprintf("cond%s-cond%s",status2,status1)
+    myargs <- list(exp_tmp,levels=colnames(coef(fit)))
+    contr  <- do.call(makeContrasts,myargs)
+    #contr <- makeContrasts(exp_tmp, levels=colnames(coef(fit)))
+    tmp <- contrasts.fit(fit,contr)
+    tmp <- eBayes(tmp)
+    top.table <- topTable(tmp,sort.by="P",n=Inf)
+    ## set p=0 to min
+    top.table[top.table$P.Value==0,"P.Value"] <- min(top.table[top.table$P.Value!=0,"P.Value"])
+    top.table$log10FDR <- log10(top.table$adj.P.Val)*(-1)
+    top.table$log10P <- log10(top.table$P.Value)*(-1)
+    top.table$signlogFDR <- sign(top.table$logFC)*top.table$log10FDR
+    top.table$signlogP <- sign(top.table$logFC)*top.table$log10P
+    
+    top.table <- top.table[order(top.table[,"signlogP"],abs(top.table[,"logFC"]),decreasing=TRUE),]
+    top.table$finalRank <- 1:nrow(top.table)
+    return(top.table)
+}
+
+#limma trend for pre-normalized data
+performDE_bulkTPM <- function(ds,cond,status1,status2){
+    #bulk
+    mm <- model.matrix(~0 + cond)
+    fit <- lmFit(ds,mm)
+    #print(head(coef(fit)))
+    exp_tmp <- sprintf("cond%s-cond%s",status2,status1)
+    myargs <- list(exp_tmp,levels=colnames(coef(fit)))
+    contr  <- do.call(makeContrasts,myargs)
+    #contr <- makeContrasts(exp_tmp, levels=colnames(coef(fit)))
+    tmp <- contrasts.fit(fit,contr)
+    tmp <- eBayes(tmp,trend=TRUE)
+    top.table <- topTable(tmp,sort.by="P",n=Inf)
+    ## set p=0 to min
+    top.table[top.table$P.Value==0,"P.Value"] <- min(top.table[top.table$P.Value!=0,"P.Value"])
+    top.table$log10FDR <- log10(top.table$adj.P.Val)*(-1)
+    top.table$log10P <- log10(top.table$P.Value)*(-1)
+    top.table$signlogFDR <- sign(top.table$logFC)*top.table$log10FDR
+    top.table$signlogP <- sign(top.table$logFC)*top.table$log10P
+    
+    top.table <- top.table[order(top.table[,"signlogP"],abs(top.table[,"logFC"]),decreasing=TRUE),]
+    top.table$finalRank <- 1:nrow(top.table)
+    return(top.table)
+}
+```
+
+# mixture samples
+## read data
+### GSE75748
+read data
+```{r message=FALSE, warning=FALSE}
+#cell bench
+##bulk
+bulk_dat <- read.csv("GSE75748_bulk_cell_type_ec.csv",header=TRUE,row.names=1)
+bulk_dat <- DGEList(bulk_dat)
+keep <- filterByExpr(bulk_dat)
+bulk_dat <- bulk_dat[keep,,keep.lib.sizes=FALSE]
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta1 <- c("H1","H1","H1","H1","H9","H9","H9","DEC","DEC","EC","EC","EC","HFF","HFF","HFF","NPC","NPC","TB","TB") 
+
+##raw
+raw_dat <- fread("GSE75748_sc_cell_type_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+alra_dat <- fread("imputed/alra/GSE75748_sc_cell_type_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+MAGIClog_dat <- fread("imputed/MAGIC_log/GSE75748_sc_cell_type_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+
+metadat1 <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat1 <- data.frame(cell=colnames(raw_dat),celltype=metadat1)
+```
+
+#### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+magiclog_coda_clr <- apply(MAGIClog_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+```
+
+
+#### normalize
+normalized/log2 data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat1,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat1,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine normalized data
+```{r}
+dat1 <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIClog_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,SGM_HKGLR=raw_coda_ilr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIClog_dat)
+rm(raw_coda_clr)
+rm(raw_coda_ilr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+
+#remove inconsistant genes
+colnames(dat1$ALRA) <- rownames(metadat1)
+colnames(dat1$ALRA_CLR) <- rownames(metadat1)
+bulk_dat1 <- bulk_dat[rownames(bulk_dat)%in%rownames(dat1$Raw_LogNorm),]
+dat1 <- lapply(dat1,function(x) x[rownames(bulk_dat1),] )
+
+real_dat1 <- dat1
+```
+
+### GSE81861
+read data
+```{r message=FALSE, warning=FALSE}
+bulk_dat <- readRDS("bulk_of_GSE81861_with_replicates_TPM.rds")
+bulk_dat <- bulk_dat[rowSums(bulk_dat>0)>0,]
+filterGene <- which(apply(bulk_dat,1,max)<5)
+bulk_dat <- bulk_dat[-filterGene,]
+bulk_meta2 <- c("K562","K562","A549","A549","GM12878","GM12878","K562","K562","IMR90","IMR90","H1","H1","GM12878","GM12878") 
+bulk_dat <- log2(bulk_dat+1)
+
+##raw
+raw_dat <- fread("GSE81861_ENCODE_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+alra_dat <- fread("imputed/alra/GSE81861_ENCODE_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+MAGIClog_dat <- fread("imputed/MAGIC_log/GSE81861_ENCODE_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+
+metadat2 <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat2 <- data.frame(cell=colnames(raw_dat),celltype=metadat2)
+```
+
+#### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+magiclog_coda_clr <- apply(MAGIClog_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+```
+
+
+#### normalize
+normalized/log2 data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat2,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat2,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine normalized data
+```{r}
+dat2 <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIClog_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,SGM_HKGLR=raw_coda_ilr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIClog_dat)
+rm(raw_coda_clr)
+rm(raw_coda_ilr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+
+#remove inconsistant genes
+colnames(dat2$ALRA) <- rownames(metadat2)
+colnames(dat2$ALRA_CLR) <- rownames(metadat2)
+bulk_dat2 <- bulk_dat[rownames(bulk_dat)%in%rownames(dat2$Raw_LogNorm),]
+dat2 <- lapply(dat2,function(x) x[rownames(bulk_dat2),] )
+
+real_dat2 <- dat2
+```
+
+### cellbench
+read data
+```{r message=FALSE, warning=FALSE}
+##bulk
+bulk_dat <- readRDS("cellbench/GSE86337_processed_count.rds")
+bulk_dat <- DGEList(bulk_dat)
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta3 <- c("HCC827","HCC827","H2228","H2228","H838","H838","A549","A549","H1975","H1975") 
+
+##raw
+raw_dat <- fread("cellbench_sc_10x_5cl_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+alra_dat <- fread("imputed/alra/cellbench_sc_10x_5cl_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+MAGIClog_dat <- fread("imputed/MAGIC_log/cellbench_sc_10x_5cl_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+
+metadat3 <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\.")[[1]][2])
+metadat3 <- data.frame(cell=colnames(raw_dat),celltype=metadat3)
+```
+
+#### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+# HKGLR
+HKGenes <- which(rownames(raw_dat)%in%c("ACTB","ARBP","GAPDH","HPRT","SDHA","UBC","YWHAZ"))
+raw_coda_ilr <- apply(tmp,2,function(x) x/exp(mean(log(x[HKGenes]))) )
+raw_coda_ilr <- log2(raw_coda_ilr)
+
+magiclog_coda_clr <- apply(MAGIClog_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+```
+
+#### normalize
+normalized/log2 data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat3,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat3,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine normalized data
+```{r}
+dat3 <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIClog_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr,SGM_HKGLR=raw_coda_ilr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIClog_dat)
+rm(raw_coda_clr)
+rm(raw_coda_ilr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+
+#remove inconsistant genes
+colnames(dat3$ALRA) <- rownames(metadat3)
+colnames(dat3$ALRA_CLR) <- rownames(metadat3)
+bulk_dat3 <- bulk_dat[rownames(bulk_dat)%in%rownames(dat3$Raw_LogNorm),]
+dat3 <- lapply(dat3,function(x) x[rownames(bulk_dat3),] )
+
+real_dat3 <- dat3
+```
+
+## AUC predictive performance
+top10 markers
+```{r message=FALSE, warning=FALSE}
+#GSE75748
+celltypes <- unique(metadat1$celltype)
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res1 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    selectedGenes <- rownames(performDE_bulk(bulk_dat1,bulk_meta1,comb_celltype[1,cb],comb_celltype[2,cb]))[1:10]
+    selectedCells <- metadat1[metadat1$celltype%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"cell"]
+    dat_AUC <- lapply(dat1,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat1[selectedCells,"celltype"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_GSE75748")
+    auc_res1 <- rbind(auc_res1,pred_perform)
+}
+
+#GSE81861
+celltypes <- unique(metadat2$celltype)
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res2 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    selectedGenes <- rownames(performDE_bulkTPM(bulk_dat2,bulk_meta2,comb_celltype[1,cb],comb_celltype[2,cb]))[1:10]
+    selectedCells <- metadat2[metadat2$celltype%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"cell"]
+    dat_AUC <- lapply(dat2,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat2[selectedCells,"celltype"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_GSE81861")
+    auc_res2 <- rbind(auc_res2,pred_perform)
+}
+auc_res2$Raw_LVHA_Group <- NA
+
+#cellbench
+celltypes <- unique(metadat3$celltype)
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res3 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    selectedGenes <- rownames(performDE_bulk(bulk_dat3,bulk_meta3,comb_celltype[1,cb],comb_celltype[2,cb]))[1:10]
+    selectedCells <- metadat3[metadat3$celltype%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"cell"]
+    dat_AUC <- lapply(dat3,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat3[selectedCells,"celltype"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_cellbench")
+    auc_res3 <- rbind(auc_res3,pred_perform)
+}
+
+#merge
+auc_res2 <- auc_res2[,colnames(auc_res1)]
+auc_res3 <- auc_res3[,colnames(auc_res1)]
+
+auc_res <- rbind(auc_res1,auc_res2,auc_res3)
+```
+
+### compare AUC(raw cutoffs)
+process data
+```{r}
+md_raw <- median(auc_res$Raw_LogNorm)
+auc_res_diff <- as.data.frame(apply(auc_res[,-1],2,function(x) x-auc_res[,1] ))
+auc_res_diff$group <- rownames(auc_res_diff)
+auc_res_diff <- data.table::melt(auc_res_diff,id.vars=c("group"))
+head(auc_res_diff)
+
+auc_res_diff$Type <- "LR-based"
+auc_res_diff[auc_res_diff$variable%in%c("Raw_SCT"),]$Type <- "Traditional"
+auc_res_diff[auc_res_diff$variable%in%c("ALRA","MAGIC"),]$Type <- "Imputation"
+auc_res_diff[auc_res_diff$variable%in%c("MAGIC_CLR","ALRA_CLR"),]$Type <- "Imputation+CLR"
+auc_res_diff$Type <- factor(auc_res_diff$Type,levels=c("Traditional","LR-based","Imputation","Imputation+CLR"))
+```
+
+Violin plot(all)
+auc_res_diff
+```{r}
+mdv <- auc_res_diff %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+auc_res_diff$variable <- factor(auc_res_diff$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(auc_res[,-1],2,function(x) wilcox.test(auc_res[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_title <- paste0("Biomarker(All;n=",nrow(auc_res),") Prediction-AUC Difference")
+mix_auc_all_bp <- ggboxplot(auc_res_diff,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("AUC Difference")+ggtitle(tmp_title)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.06,label=paste0("Raw LogNorm(Median=",round(md_raw,2),")"),color="seagreen",size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+annotate(geom="text",x=c(1:length(pv_sig)),y=0.75,label=pv_sig,size=7)+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=16),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")+scale_fill_brewer(palette="Set2")
+mix_auc_all_bp
+```
+
+Violin plot(Raw <=0.75 genes)
+auc_res_diff
+```{r}
+selectedTerms <- rownames(auc_res[auc_res$Raw_LogNorm<=0.75,])
+md_raw <- median(auc_res[selectedTerms,]$Raw_LogNorm)
+
+auc_res_diff2 <- auc_res_diff[auc_res_diff$group%in%selectedTerms,]
+mdv <- auc_res_diff2 %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+auc_res_diff2$variable <- factor(auc_res_diff2$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(auc_res[selectedTerms,-1],2,function(x) wilcox.test(auc_res[selectedTerms,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_title <- paste0("Biomarker(Raw AUC<=0.75;n=",length(selectedTerms),") Prediction-AUC Difference")
+mix_auc_0.75_bp <- ggboxplot(auc_res_diff2,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+ylab("AUC Difference")+ggtitle(tmp_title)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.06,label=paste0("Raw LogNorm(Median=",round(md_raw,2),")"),color="seagreen",size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+annotate(geom="text",x=c(1:length(pv_sig)),y=0.75,label=pv_sig,size=7)+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=16),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")+scale_fill_brewer(palette="Set2")
+mix_auc_0.75_bp
+```
+
+Violin plot(Raw <=0.6 genes)
+```{r}
+selectedTerms <- rownames(auc_res[auc_res$Raw_LogNorm<=0.6,])
+md_raw <- median(auc_res[selectedTerms,]$Raw_LogNorm)
+
+auc_res_diff2 <- auc_res_diff[auc_res_diff$group%in%selectedTerms,]
+mdv <- auc_res_diff2 %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+auc_res_diff2$variable <- factor(auc_res_diff2$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(auc_res[selectedTerms,-1],2,function(x) wilcox.test(auc_res[selectedTerms,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_title <- paste0("Biomarker(Raw AUC<=0.6;n=",length(selectedTerms),") Prediction-AUC Difference")
+mix_auc_0.6_bp <- ggboxplot(auc_res_diff2,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+ylab("AUC Difference")+ggtitle(tmp_title)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.06,label=paste0("Raw LogNorm(Median=",round(md_raw,2),")"),color="seagreen",size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+annotate(geom="text",x=c(1:length(pv_sig)),y=0.75,label=pv_sig,size=7)+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=16),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")+scale_fill_brewer(palette="Set2")
+mix_auc_0.6_bp
+```
+
+heatmap
+```{r}
+mdv <- auc_res_diff2 %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+auc_res_diff2$variable <- factor(auc_res_diff2$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+tmp_hm <- auc_res_diff2[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.1),-0.1,tmp_hm$value)
+colnames(tmp_hm)[3] <- "AUC_difference" 
+tmp_title <- paste0("Biomarker(Raw AUC<=0.6;n=",length(selectedTerms),") Predictive Performance-AUC Difference(Mixture)")
+mix_auc_0.6_hm <- ggplot(tmp_hm,aes(variable,group,fill=AUC_difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+theme(axis.text.y=element_blank())+xlab("Method")+ggtitle(tmp_title)+ylab("Biomarkers")
+mix_auc_0.6_hm
+```
+
+### compare number
+AUC>=0.6
+p-values chi square
+```{r}
+auc_res_num_gt <- apply(auc_res,2,function(x) sum(x>=0.6,na.rm=TRUE))
+auc_res_num_lt <- apply(auc_res,2,function(x) sum(x<0.6,na.rm=TRUE))
+auc_res_num_p <- cbind(auc_res_num_gt,auc_res_num_lt)
+pvalues <- c(1)
+for(i in 2:nrow(auc_res_num_p)){
+    tmp_p <- chisq.test(auc_res_num_p[c(1,i),])$p.value
+    pvalues <- c(pvalues,tmp_p)
+}
+pvalues <- as.numeric(pvalues)
+pvalues <- sapply(pvalues,getPsig)
+names(pvalues) <- rownames(auc_res_num_p)
+pvalues
+```
+
+```{r}
+auc_res_num <- apply(auc_res,2,function(x) sum(x>=0.6,na.rm=TRUE)/sum(!is.na(x)) )
+raw_value <- auc_res_num[1]
+auc_res_num <- data.frame(Method=names(auc_res_num),Pct=auc_res_num)
+auc_res_num$Method <- factor(auc_res_num$Method,levels=auc_res_num[order(auc_res_num$Pct),"Method"])
+
+pvalues <- pvalues[levels(auc_res_num$Method)]
+
+auc_res_num$Type <- "LR-based"
+auc_res_num[auc_res_num$Method%in%c("Raw_SCT","Raw_LogNorm"),]$Type <- "Traditional"
+auc_res_num[auc_res_num$Method%in%c("ALRA","MAGIC"),]$Type <- "Imputation"
+auc_res_num[auc_res_num$Method%in%c("MAGIC_CLR","ALRA_CLR"),]$Type <- "Imputation+CLR"
+auc_res_num$Type <- factor(auc_res_num$Type,levels=c("Traditional","LR-based","Imputation","Imputation+CLR"))
+
+tmp_title <- paste0("% true positive(AUC>0.6) biomarkers identified among 41x10 DEGs")
+mix_auc_num_0.6_bp <- ggbarplot(auc_res_num,x="Method",y="Pct",fill="Type")+geom_hline(yintercept=raw_value,linetype="dashed")+ylab("Proportion")+ggtitle(tmp_title)+coord_cartesian(ylim=c(0.9,1.04))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=16),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")+scale_fill_brewer(palette="Set2")+annotate(geom="text",x=c(1:length(pvalues)),y=1.02,label=pvalues,size=7)
+mix_auc_num_0.6_bp
+```
+
+# simulated data
+## data1
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- true_dat@assays@data$counts
+##imputed
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+MAGIClog_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout92.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+
+metadat1 <- as.data.frame(colData(true_dat))
+gmetadat1 <- as.data.frame(rowData(true_dat))
+metadat1$Group <- as.character(metadat1$Group)
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+magiclog_coda_clr <- apply(MAGIClog_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+```
+
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat1,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat1,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat1 <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIClog_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIClog_dat)
+rm(raw_coda_clr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+
+#remove low expressed/inconsistent genes
+dat1 <- lapply(dat1,function(x) x[rownames(dat1$Raw_LogNorm),] )
+dat1 <- lapply(dat1,function(x) x[,metadat1$Cell] )
+
+sim_dat1 <- dat1
+```
+
+## data2
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- as.matrix(true_dat@assays@data$counts)
+##imputed
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+MAGIClog_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_oridropout68.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+
+metadat2 <- as.data.frame(colData(true_dat))
+gmetadat2 <- as.data.frame(rowData(true_dat))
+metadat2$Group <- as.character(metadat2$Group)
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+magiclog_coda_clr <- apply(MAGIClog_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat2,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat2,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat2 <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIClog_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIClog_dat)
+rm(raw_coda_clr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+
+#remove low expressed/inconsistent genes
+dat2 <- lapply(dat2,function(x) x[rownames(dat2$Raw_LogNorm),] )
+dat2 <- lapply(dat2,function(x) x[,metadat2$Cell] )
+
+sim_dat2 <- dat2
+```
+
+## data3
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- as.matrix(true_dat@assays@data$counts)
+##imputed
+alra_dat <- fread("imputed/alra/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+MAGIClog_dat <- fread("imputed/MAGIC_log/Sim_CB10x5cl_G10kC1500_5UGroup_dropout43.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+
+metadat3 <- as.data.frame(colData(true_dat))
+gmetadat3 <- as.data.frame(rowData(true_dat))
+metadat3$Group <- as.character(metadat3$Group)
+```
+
+### CoDA
+```{r}
+#add pseudocount s/gm to raw count
+tmp <- as.matrix(raw_dat)
+gm_s <- exp(mean(log(apply(tmp,2,sum))))
+tmp <- apply(tmp,2,function(x) x+(sum(x)/gm_s) )
+tmp <- t(CLOSE(t(tmp)))
+
+#CLR
+raw_coda_clr <- apply(tmp,2,function(x) x/exp(mean(log(x))) )
+raw_coda_clr <- log2(raw_coda_clr)
+
+magiclog_coda_clr <- apply(MAGIClog_dat,2,function(x) x-mean(x))
+alra_coda_clr <- apply(alra_dat,2,function(x) x-mean(x))
+```
+
+### normalize
+normalized data
+```{r}
+raw_lognorm <- CreateSeuratObject(counts=raw_dat,meta.data=metadat3,min.cells=0,min.features=0)
+raw_lognorm <- NormalizeData(raw_lognorm)
+raw_lognorm <- as.matrix(raw_lognorm@assays$RNA@data)
+
+raw_sct <- CreateSeuratObject(counts=raw_dat,meta.data=metadat3,min.cells=0,min.features=0)
+raw_sct <- SCTransform(raw_sct,vst.flavor="v2",verbose=FALSE,min_cells=0)
+raw_sct <- as.matrix(raw_sct@assays$SCT@data)
+raw_sct[1:5,1:5]
+```
+
+combine data
+```{r}
+dat3 <- list(Raw_LogNorm=raw_lognorm,Raw_SCT=raw_sct,ALRA=alra_dat,MAGIC=MAGIClog_dat,SGM_CLR=raw_coda_clr,ALRA_CLR=alra_coda_clr,MAGIC_CLR=magiclog_coda_clr)
+rm(raw_dat)
+rm(alra_dat)
+rm(MAGIClog_dat)
+rm(raw_coda_clr)
+rm(raw_lognorm)
+rm(raw_sct)
+rm(alra_coda_clr)
+rm(magiclog_coda_clr)
+
+#remove low expressed/inconsistent genes
+dat3 <- lapply(dat3,function(x) x[rownames(dat3$Raw_LogNorm),] )
+dat3 <- lapply(dat3,function(x) x[,metadat3$Cell] )
+
+sim_dat3 <- dat3
+```
+
+## AUC predictive perform
+```{r}
+getAUC <- function(x,outcome){
+    tmp <- auc(outcome,x)
+    tmp <- attr(tmp,"roc")$auc
+    return(tmp)
+}
+```
+
+select 20 top +-ES
+```{r message=FALSE, warning=FALSE}
+DEres <- readRDS("DEGs_SimCB92.rds")
+metadat1$Group <- as.character(metadat1$Group)
+
+celltypes <- as.character(unique(metadat1$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res1 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- DEGs[c(1:10,(length(DEGs)-9):length(DEGs))]
+    selectedCells <- metadat1[metadat1$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat1,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat1[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_SimCB92")
+    auc_res1 <- rbind(auc_res1,pred_perform)
+}
+
+
+DEres <- readRDS("DEGs_SimCB68.rds")
+metadat2$Group <- as.character(metadat2$Group)
+
+celltypes <- as.character(unique(metadat2$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res2 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- DEGs[c(1:10,(length(DEGs)-9):length(DEGs))]
+    selectedCells <- metadat2[metadat2$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat2,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat2[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_SimCB68")
+    auc_res2 <- rbind(auc_res2,pred_perform)
+}
+
+DEres <- readRDS("DEGs_SimCB43.rds")
+metadat3$Group <- as.character(metadat3$Group)
+
+celltypes <- as.character(unique(metadat3$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res3 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- DEGs[c(1:10,(length(DEGs)-9):length(DEGs))]
+    selectedCells <- metadat3[metadat3$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat3,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat3[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_SimCB43")
+    auc_res3 <- rbind(auc_res3,pred_perform)
+}
+
+#merge
+auc_res2 <- auc_res2[,colnames(auc_res1)]
+auc_res3 <- auc_res3[,colnames(auc_res1)]
+auc_res <- rbind(auc_res1,auc_res2,auc_res3)
+```
+
+### compare number
+AUC>=0.6
+p-values chi square
+```{r}
+auc_res_num_gt <- apply(auc_res,2,function(x) sum(x>=0.6,na.rm=TRUE))
+auc_res_num_lt <- apply(auc_res,2,function(x) sum(x<0.6,na.rm=TRUE))
+auc_res_num_p <- cbind(auc_res_num_gt,auc_res_num_lt)
+pvalues <- c(1)
+for(i in 2:nrow(auc_res_num_p)){
+    tmp_p <- chisq.test(auc_res_num_p[c(1,i),])$p.value
+    pvalues <- c(pvalues,tmp_p)
+}
+pvalues <- as.numeric(pvalues)
+pvalues <- sapply(pvalues,getPsig)
+names(pvalues) <- rownames(auc_res_num_p)
+pvalues
+```
+
+```{r}
+auc_res_num <- apply(auc_res,2,function(x) sum(x>=0.6,na.rm=TRUE)/sum(!is.na(x)) )
+raw_value <- auc_res_num[1]
+auc_res_num <- data.frame(Method=names(auc_res_num),Pct=auc_res_num)
+auc_res_num$Method <- factor(auc_res_num$Method,levels=auc_res_num[order(auc_res_num$Pct),"Method"])
+
+pvalues <- pvalues[levels(auc_res_num$Method)]
+
+auc_res_num$Type <- "LR-based"
+auc_res_num[auc_res_num$Method%in%c("Raw_SCT","Raw_LogNorm"),]$Type <- "Traditional"
+auc_res_num[auc_res_num$Method%in%c("ALRA","MAGIC"),]$Type <- "Imputation"
+auc_res_num[auc_res_num$Method%in%c("MAGIC_CLR","ALRA_CLR"),]$Type <- "Imputation+CLR"
+auc_res_num$Type <- factor(auc_res_num$Type,levels=c("Traditional","LR-based","Imputation","Imputation+CLR"))
+
+tmp_title <- paste0("% true positive(AUC>0.6) biomarkers identified among 30x20 DEGs")
+sim_auc_num_0.6_bp <- ggbarplot(auc_res_num,x="Method",y="Pct",fill="Type")+geom_hline(yintercept=raw_value,linetype="dashed")+ylab("Proportion")+ggtitle(tmp_title)+coord_cartesian(ylim=c(0,1.04))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=16),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")+scale_fill_brewer(palette="Set2")+annotate(geom="text",x=c(1:length(pvalues)),y=1.02,label=pvalues,size=7)
+sim_auc_num_0.6_bp
+```
+
+## AUC predictive perform(non marker)
+```{r}
+getAUC <- function(x,outcome){
+    tmp <- auc(outcome,x)
+    tmp <- attr(tmp,"roc")$auc
+    return(tmp)
+}
+```
+
+random 50 non-markers
+```{r message=FALSE, warning=FALSE}
+DEres <- readRDS("DEGs_SimCB92.rds")
+metadat1$Group <- as.character(metadat1$Group)
+allGenes <- rownames(DEres$sc_Group1_Group4)
+
+celltypes <- as.character(unique(metadat1$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res1 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- allGenes[!allGenes%in%DEGs][1:50]
+    selectedCells <- metadat1[metadat1$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat1,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat1[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_SimCB92")
+    auc_res1 <- rbind(auc_res1,pred_perform)
+}
+
+DEres <- readRDS("DEGs_SimCB68.rds")
+metadat2$Group <- as.character(metadat2$Group)
+allGenes <- rownames(DEres$sc_Group1_Group4)
+
+celltypes <- as.character(unique(metadat2$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res2 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- allGenes[!allGenes%in%DEGs][1:50]
+    selectedCells <- metadat2[metadat2$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat2,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat2[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_SimCB68")
+    auc_res2 <- rbind(auc_res2,pred_perform)
+}
+
+DEres <- readRDS("DEGs_SimCB43.rds")
+metadat3$Group <- as.character(metadat3$Group)
+allGenes <- rownames(DEres$sc_Group1_Group4)
+
+celltypes <- as.character(unique(metadat3$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res3 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- allGenes[!allGenes%in%DEGs][1:50]
+    selectedCells <- metadat3[metadat3$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat1,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat3[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_SimCB43")
+    auc_res3 <- rbind(auc_res3,pred_perform)
+}
+
+#merge
+auc_res2 <- auc_res2[,colnames(auc_res1)]
+auc_res3 <- auc_res3[,colnames(auc_res1)]
+auc_res <- rbind(auc_res1,auc_res2,auc_res3)
+```
+
+### compare number
+AUC>=0.6
+p-values chi square
+```{r}
+auc_res_num_gt <- apply(auc_res,2,function(x) sum(x>=0.6,na.rm=TRUE))
+auc_res_num_lt <- apply(auc_res,2,function(x) sum(x<0.6,na.rm=TRUE))
+auc_res_num_p <- cbind(auc_res_num_gt,auc_res_num_lt)
+pvalues <- c(1)
+for(i in 2:nrow(auc_res_num_p)){
+    tmp_p <- chisq.test(auc_res_num_p[c(1,i),])$p.value
+    pvalues <- c(pvalues,tmp_p)
+}
+pvalues[is.nan(pvalues)] <- 1
+pvalues <- as.numeric(pvalues)
+pvalues <- sapply(pvalues,getPsig)
+names(pvalues) <- rownames(auc_res_num_p)
+pvalues
+```
+
+```{r}
+auc_res_num <- apply(auc_res,2,function(x) sum(x>=0.6,na.rm=TRUE)/sum(!is.na(x)) )
+raw_value <- auc_res_num[1]
+auc_res_num <- data.frame(Method=names(auc_res_num),Pct=auc_res_num)
+auc_res_num$Method <- factor(auc_res_num$Method,levels=auc_res_num[order(auc_res_num$Pct),"Method"])
+
+pvalues <- pvalues[levels(auc_res_num$Method)]
+
+auc_res_num$Type <- "LR-based"
+auc_res_num[auc_res_num$Method%in%c("Raw_SCT","Raw_LogNorm"),]$Type <- "Traditional"
+auc_res_num[auc_res_num$Method%in%c("ALRA","MAGIC"),]$Type <- "Imputation"
+auc_res_num[auc_res_num$Method%in%c("MAGIC_CLR","ALRA_CLR"),]$Type <- "Imputation+CLR"
+auc_res_num$Type <- factor(auc_res_num$Type,levels=c("Traditional","LR-based","Imputation","Imputation+CLR"))
+
+tmp_title <- paste0("% false positive(AUC>0.6) biomarkers identified among 30x50 non-DEGs")
+sim_nonbm_auc_num_0.6_bp <- ggbarplot(auc_res_num,x="Method",y="Pct",fill="Type")+geom_hline(yintercept=raw_value,linetype="dashed")+ylab("Percentage,%")+ggtitle(tmp_title)+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=16),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))+xlab("Method")+scale_fill_brewer(palette="Set2")+annotate(geom="text",x=c(1:length(pvalues)),y=0.6,label=pvalues,size=7)+coord_cartesian(ylim=c(0,0.63))
+sim_nonbm_auc_num_0.6_bp
+```
+
+
+# combine plots
+## AUC raw cutoffs s/gm(s)
+main1
+```{r fig.height=4.7, fig.width=24}
+main1 <- ggarrange(mix_auc_all_bp,mix_auc_0.75_bp,mix_auc_num_0.6_bp,ncol=3,nrow=1,labels="AUTO")
+main1
+```
+
+main2
+```{r fig.height=4.7, fig.width=16}
+main2 <- ggarrange(sim_auc_num_0.6_bp,sim_nonbm_auc_num_0.6_bp,ncol=2,nrow=1,labels=c("D","E"))
+main2
+```
+
+supp1
+```{r fig.height=7.5, fig.width=11.5}
+supp1 <- ggarrange(mix_auc_0.9_bp,mix_auc_num_0.9_bp,mix_auc_num_0.6_bp,sim_auc_0.9_bp,sim_auc_num_0.9_bp,sim_auc_num_0.6_bp,sim_nonbm_auc_num_0.9_bp,sim_nonbm_auc_num_0.6_bp,ncol=3,nrow=3,labels="AUTO")
+supp1
+```
